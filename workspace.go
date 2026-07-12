@@ -75,6 +75,38 @@ type evidenceLinkPayload struct {
 	Source FactRef `json:"source"`
 }
 
+type reviewPayload struct {
+	Subject  FactRef
+	Outcome  string
+	Findings string
+}
+
+type approvalPayload struct {
+	Subject  FactRef
+	Scope    string
+	Decision string
+	Note     string
+}
+
+type policyDecisionPayload struct {
+	Subject FactRef `json:"subject"`
+	Action  string  `json:"action"`
+	Policy  string  `json:"policy"`
+	Result  string  `json:"result"`
+}
+
+type deliveryPayload struct {
+	Artifacts []FactRef `json:"artifacts"`
+	Format    string    `json:"format"`
+	Scope     string    `json:"scope"`
+	Target    string    `json:"target"`
+}
+
+type opaquePayload struct {
+	Kind string
+	Data json.RawMessage
+}
+
 type nativeState struct {
 	tasks map[string]bool
 	facts map[string]Fact
@@ -96,9 +128,7 @@ func (s *nativeState) add(fact Fact) {
 }
 
 func (s *nativeState) validate(taskID, kind string, payload json.RawMessage) (string, error) {
-	switch kind {
-	case KindTaskCreated, KindRunRecorded, KindInputRegistered, KindArtifactRecorded, KindClaimRecorded, KindSourceReferenceRecorded, KindEvidenceLinked:
-	default:
+	if !isNativeKind(kind) {
 		return "unknown_kind", errors.New("native fact kind is not supported")
 	}
 	taskExists := s.tasks[taskID]
@@ -139,6 +169,37 @@ func (s *nativeState) validate(taskID, kind string, payload json.RawMessage) (st
 		if err == nil {
 			err = validateFactReference(taskID, &evidence.Source, s.facts, KindSourceReferenceRecorded, "evidence Source Reference")
 		}
+	case KindReviewRecorded:
+		var review reviewPayload
+		review, err = decodeReviewPayload(payload)
+		if err == nil {
+			err = validateFactReference(taskID, &review.Subject, s.facts, "", "review subject")
+		}
+	case KindApprovalRecorded:
+		var approval approvalPayload
+		approval, err = decodeApprovalPayload(payload)
+		if err == nil {
+			err = validateFactReference(taskID, &approval.Subject, s.facts, "", "approval subject")
+		}
+	case KindPolicyDecisionRecorded:
+		var decision policyDecisionPayload
+		decision, err = decodePolicyDecisionPayload(payload)
+		if err == nil {
+			err = validateFactReference(taskID, &decision.Subject, s.facts, "", "policy decision subject")
+		}
+	case KindDeliveryRecorded:
+		var delivery deliveryPayload
+		delivery, err = decodeDeliveryPayload(payload)
+		if err == nil {
+			for i := range delivery.Artifacts {
+				err = validateFactReference(taskID, &delivery.Artifacts[i], s.facts, KindArtifactRecorded, "delivery Artifact")
+				if err != nil {
+					break
+				}
+			}
+		}
+	case KindOpaqueRecorded:
+		_, err = decodeOpaquePayload(payload)
 	}
 	return "invalid_payload", err
 }
@@ -301,6 +362,8 @@ func (w *Workspace) Replay() (Projection, error) {
 				TaskID: fact.TaskID, SourceFactID: fact.FactID, Definition: definition,
 				Runs: []RunProjection{}, RegisteredInputs: []RegisteredInputProjection{}, Artifacts: []ArtifactProjection{},
 				Claims: []ClaimProjection{}, SourceReferences: []SourceReferenceProjection{}, EvidenceLinks: []EvidenceLinkProjection{},
+				Reviews: []ReviewProjection{}, Approvals: []ApprovalProjection{}, PolicyDecisions: []PolicyDecisionProjection{},
+				Deliveries: []DeliveryProjection{}, OpaqueFacts: []OpaqueFactProjection{},
 			})
 		case KindRunRecorded:
 			payload, _ := decodeRunPayload(fact.Payload)
@@ -328,6 +391,26 @@ func (w *Workspace) Replay() (Projection, error) {
 			payload, _ := decodeEvidenceLinkPayload(fact.Payload)
 			task := &projection.Tasks[taskIndexes[fact.TaskID]]
 			task.EvidenceLinks = append(task.EvidenceLinks, EvidenceLinkProjection{SourceFactID: fact.FactID, Claim: payload.Claim, Source: payload.Source})
+		case KindReviewRecorded:
+			payload, _ := decodeReviewPayload(fact.Payload)
+			task := &projection.Tasks[taskIndexes[fact.TaskID]]
+			task.Reviews = append(task.Reviews, ReviewProjection{SourceFactID: fact.FactID, Subject: payload.Subject, Outcome: payload.Outcome, Findings: payload.Findings})
+		case KindApprovalRecorded:
+			payload, _ := decodeApprovalPayload(fact.Payload)
+			task := &projection.Tasks[taskIndexes[fact.TaskID]]
+			task.Approvals = append(task.Approvals, ApprovalProjection{SourceFactID: fact.FactID, Subject: payload.Subject, Scope: payload.Scope, Decision: payload.Decision, Note: payload.Note})
+		case KindPolicyDecisionRecorded:
+			payload, _ := decodePolicyDecisionPayload(fact.Payload)
+			task := &projection.Tasks[taskIndexes[fact.TaskID]]
+			task.PolicyDecisions = append(task.PolicyDecisions, PolicyDecisionProjection{SourceFactID: fact.FactID, Subject: payload.Subject, Action: payload.Action, Policy: payload.Policy, Result: payload.Result})
+		case KindDeliveryRecorded:
+			payload, _ := decodeDeliveryPayload(fact.Payload)
+			task := &projection.Tasks[taskIndexes[fact.TaskID]]
+			task.Deliveries = append(task.Deliveries, DeliveryProjection{SourceFactID: fact.FactID, Artifacts: payload.Artifacts, Format: payload.Format, Scope: payload.Scope, Target: payload.Target})
+		case KindOpaqueRecorded:
+			payload, _ := decodeOpaquePayload(fact.Payload)
+			task := &projection.Tasks[taskIndexes[fact.TaskID]]
+			task.OpaqueFacts = append(task.OpaqueFacts, OpaqueFactProjection{SourceFactID: fact.FactID, Kind: payload.Kind, Data: payload.Data})
 		}
 	}
 	return projection, nil
@@ -588,6 +671,133 @@ func decodeEvidenceLinkPayload(raw json.RawMessage) (evidenceLinkPayload, error)
 	return payload, nil
 }
 
+func decodeReviewPayload(raw json.RawMessage) (reviewPayload, error) {
+	if err := jsonstrict.Validate(raw); err != nil {
+		return reviewPayload{}, err
+	}
+	var encoded struct {
+		Subject  FactRef         `json:"subject"`
+		Outcome  string          `json:"outcome"`
+		Findings json.RawMessage `json:"findings"`
+	}
+	if err := strictDecode(raw, &encoded); err != nil {
+		return reviewPayload{}, fmt.Errorf("invalid review payload: %w", err)
+	}
+	if !validFactRef(encoded.Subject) || encoded.Outcome == "" {
+		return reviewPayload{}, errors.New("review requires an exact subject and non-empty outcome")
+	}
+	findings, err := decodeOptionalNonEmptyString(encoded.Findings, "review findings")
+	if err != nil {
+		return reviewPayload{}, err
+	}
+	return reviewPayload{Subject: encoded.Subject, Outcome: encoded.Outcome, Findings: findings}, nil
+}
+
+func decodeApprovalPayload(raw json.RawMessage) (approvalPayload, error) {
+	if err := jsonstrict.Validate(raw); err != nil {
+		return approvalPayload{}, err
+	}
+	var encoded struct {
+		Subject  FactRef         `json:"subject"`
+		Scope    string          `json:"scope"`
+		Decision string          `json:"decision"`
+		Note     json.RawMessage `json:"note"`
+	}
+	if err := strictDecode(raw, &encoded); err != nil {
+		return approvalPayload{}, fmt.Errorf("invalid approval payload: %w", err)
+	}
+	if !validFactRef(encoded.Subject) || encoded.Scope == "" || encoded.Decision == "" {
+		return approvalPayload{}, errors.New("approval requires an exact subject and non-empty scope and decision")
+	}
+	note, err := decodeOptionalNonEmptyString(encoded.Note, "approval note")
+	if err != nil {
+		return approvalPayload{}, err
+	}
+	return approvalPayload{Subject: encoded.Subject, Scope: encoded.Scope, Decision: encoded.Decision, Note: note}, nil
+}
+
+func decodePolicyDecisionPayload(raw json.RawMessage) (policyDecisionPayload, error) {
+	if err := jsonstrict.Validate(raw); err != nil {
+		return policyDecisionPayload{}, err
+	}
+	var payload policyDecisionPayload
+	if err := strictDecode(raw, &payload); err != nil {
+		return policyDecisionPayload{}, fmt.Errorf("invalid policy decision payload: %w", err)
+	}
+	if !validFactRef(payload.Subject) || payload.Action == "" || payload.Policy == "" || payload.Result == "" {
+		return policyDecisionPayload{}, errors.New("policy decision requires an exact subject and non-empty action, policy, and result")
+	}
+	return payload, nil
+}
+
+func decodeDeliveryPayload(raw json.RawMessage) (deliveryPayload, error) {
+	if err := jsonstrict.Validate(raw); err != nil {
+		return deliveryPayload{}, err
+	}
+	var payload deliveryPayload
+	if err := strictDecode(raw, &payload); err != nil {
+		return deliveryPayload{}, fmt.Errorf("invalid delivery payload: %w", err)
+	}
+	if len(payload.Artifacts) == 0 || payload.Format == "" || payload.Scope == "" || payload.Target == "" {
+		return deliveryPayload{}, errors.New("delivery requires Artifacts and non-empty format, scope, and target")
+	}
+	seen := make(map[string]bool, len(payload.Artifacts))
+	for _, artifact := range payload.Artifacts {
+		if !validFactRef(artifact) {
+			return deliveryPayload{}, errors.New("delivery Artifacts must be exact Fact References")
+		}
+		if seen[artifact.FactID] {
+			return deliveryPayload{}, errors.New("delivery Artifacts must not contain duplicates")
+		}
+		seen[artifact.FactID] = true
+	}
+	return payload, nil
+}
+
+func decodeOpaquePayload(raw json.RawMessage) (opaquePayload, error) {
+	if err := jsonstrict.Validate(raw); err != nil {
+		return opaquePayload{}, err
+	}
+	var encoded struct {
+		Kind string          `json:"kind"`
+		Data json.RawMessage `json:"data"`
+	}
+	if err := strictDecode(raw, &encoded); err != nil {
+		return opaquePayload{}, fmt.Errorf("invalid opaque payload: %w", err)
+	}
+	if encoded.Kind == "" || isNativeKind(encoded.Kind) {
+		return opaquePayload{}, errors.New("opaque Fact requires a non-native external kind")
+	}
+	if _, err := decodeOrderedObject(encoded.Data); err != nil {
+		return opaquePayload{}, errors.New("opaque Fact data must be a JSON object")
+	}
+	return opaquePayload{Kind: encoded.Kind, Data: append(json.RawMessage(nil), encoded.Data...)}, nil
+}
+
+func decodeOptionalNonEmptyString(raw json.RawMessage, name string) (string, error) {
+	if len(raw) == 0 {
+		return "", nil
+	}
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '"' {
+		return "", fmt.Errorf("%s must be a non-empty string when present", name)
+	}
+	var value string
+	if err := strictDecode(trimmed, &value); err != nil || value == "" {
+		return "", fmt.Errorf("%s must be a non-empty string when present", name)
+	}
+	return value, nil
+}
+
+func isNativeKind(kind string) bool {
+	switch kind {
+	case KindTaskCreated, KindRunRecorded, KindInputRegistered, KindArtifactRecorded, KindClaimRecorded, KindSourceReferenceRecorded, KindEvidenceLinked, KindReviewRecorded, KindApprovalRecorded, KindPolicyDecisionRecorded, KindDeliveryRecorded, KindOpaqueRecorded:
+		return true
+	default:
+		return false
+	}
+}
+
 func validFactRef(ref FactRef) bool {
 	return ref.FactID != "" && nativeHash.MatchString(ref.RecordHash)
 }
@@ -603,7 +813,7 @@ func validateFactReference(taskID string, ref *FactRef, prior map[string]Fact, k
 	if fact.TaskID != taskID {
 		return fmt.Errorf("%s must belong to the same Task", name)
 	}
-	if fact.Kind != kind {
+	if kind != "" && fact.Kind != kind {
 		return fmt.Errorf("%s must reference %s", name, kind)
 	}
 	if fact.RecordHash != ref.RecordHash {

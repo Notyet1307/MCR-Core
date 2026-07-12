@@ -249,6 +249,278 @@ func TestClaimsSourcesAndEvidenceRoundTrip(t *testing.T) {
 	}
 }
 
+func TestGovernanceDeliveryAndOpaqueRoundTrip(t *testing.T) {
+	workspace, err := mcr.Create(t.TempDir(), "workspace-governance")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	taskFact, err := workspace.Submit(validTaskSubmission("task-1"))
+	if err != nil {
+		t.Fatalf("Submit Task: %v", err)
+	}
+	content := mcr.ContentRef{Locator: "urn:example:artifact", SHA256: digest}
+	artifact1, err := workspace.Submit(submission("task-1", mcr.KindArtifactRecorded, map[string]any{"content": content}))
+	if err != nil {
+		t.Fatalf("Submit Artifact 1: %v", err)
+	}
+	artifact2, err := workspace.Submit(submission("task-1", mcr.KindArtifactRecorded, map[string]any{"content": content}))
+	if err != nil {
+		t.Fatalf("Submit Artifact 2: %v", err)
+	}
+	claim, err := workspace.Submit(submission("task-1", mcr.KindClaimRecorded, map[string]any{"statement": "Exact statement."}))
+	if err != nil {
+		t.Fatalf("Submit Claim: %v", err)
+	}
+	taskSubject := mcr.FactRef{FactID: taskFact.FactID, RecordHash: taskFact.RecordHash}
+	review, err := workspace.Submit(submission("task-1", mcr.KindReviewRecorded, map[string]any{
+		"subject": taskSubject, "outcome": "changes_requested", "findings": "Clarify the scope.",
+	}))
+	if err != nil {
+		t.Fatalf("Submit Review: %v", err)
+	}
+	reviewSubject := mcr.FactRef{FactID: review.FactID, RecordHash: review.RecordHash}
+	approval, err := workspace.Submit(submission("task-1", mcr.KindApprovalRecorded, map[string]any{
+		"subject": reviewSubject, "scope": "release-candidate", "decision": "approved", "note": "Adapter decision.",
+	}))
+	if err != nil {
+		t.Fatalf("Submit Approval: %v", err)
+	}
+	claimSubject := mcr.FactRef{FactID: claim.FactID, RecordHash: claim.RecordHash}
+	policy, err := workspace.Submit(submission("task-1", mcr.KindPolicyDecisionRecorded, map[string]any{
+		"subject": claimSubject, "action": "prepare", "policy": "external-policy-v1", "result": "allow",
+	}))
+	if err != nil {
+		t.Fatalf("Submit Policy Decision: %v", err)
+	}
+	artifactRefs := []mcr.FactRef{
+		{FactID: artifact1.FactID, RecordHash: artifact1.RecordHash},
+		{FactID: artifact2.FactID, RecordHash: artifact2.RecordHash},
+	}
+	delivery, err := workspace.Submit(submission("task-1", mcr.KindDeliveryRecorded, map[string]any{
+		"artifacts": artifactRefs, "format": "application/zip", "scope": "release-candidate", "target": "urn:example:delivery-target",
+	}))
+	if err != nil {
+		t.Fatalf("Submit Delivery: %v", err)
+	}
+	opaqueData := json.RawMessage(`{"session":"external-1","details":{"attempt":2}}`)
+	opaque, err := workspace.Submit(submission("task-1", mcr.KindOpaqueRecorded, map[string]any{
+		"kind": "adapter.runtime_observation", "data": opaqueData,
+	}))
+	if err != nil {
+		t.Fatalf("Submit Opaque Fact: %v", err)
+	}
+
+	facts, err := workspace.Query(mcr.FactQuery{TaskID: "task-1"})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	wantIDs := []string{taskFact.FactID, artifact1.FactID, artifact2.FactID, claim.FactID, review.FactID, approval.FactID, policy.FactID, delivery.FactID, opaque.FactID}
+	if len(facts) != len(wantIDs) {
+		t.Fatalf("Query count = %d, want %d", len(facts), len(wantIDs))
+	}
+	for i, want := range wantIDs {
+		if facts[i].FactID != want {
+			t.Fatalf("Query order = %+v", facts)
+		}
+	}
+	for _, kind := range []string{mcr.KindReviewRecorded, mcr.KindApprovalRecorded, mcr.KindPolicyDecisionRecorded, mcr.KindDeliveryRecorded, mcr.KindOpaqueRecorded} {
+		filtered, err := workspace.Query(mcr.FactQuery{Kind: kind})
+		if err != nil || len(filtered) != 1 || filtered[0].Kind != kind {
+			t.Fatalf("Query %s = %+v, %v", kind, filtered, err)
+		}
+	}
+
+	projection, err := workspace.Replay()
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	task := projection.Tasks[0]
+	if len(task.Reviews) != 1 || task.Reviews[0].SourceFactID != review.FactID || task.Reviews[0].Subject != taskSubject || task.Reviews[0].Outcome != "changes_requested" || task.Reviews[0].Findings != "Clarify the scope." {
+		t.Fatalf("Reviews = %+v", task.Reviews)
+	}
+	if len(task.Approvals) != 1 || task.Approvals[0].SourceFactID != approval.FactID || task.Approvals[0].Subject != reviewSubject || task.Approvals[0].Scope != "release-candidate" || task.Approvals[0].Decision != "approved" || task.Approvals[0].Note != "Adapter decision." {
+		t.Fatalf("Approvals = %+v", task.Approvals)
+	}
+	if len(task.PolicyDecisions) != 1 || task.PolicyDecisions[0].SourceFactID != policy.FactID || task.PolicyDecisions[0].Subject != claimSubject || task.PolicyDecisions[0].Action != "prepare" || task.PolicyDecisions[0].Policy != "external-policy-v1" || task.PolicyDecisions[0].Result != "allow" {
+		t.Fatalf("Policy Decisions = %+v", task.PolicyDecisions)
+	}
+	if len(task.Deliveries) != 1 || task.Deliveries[0].SourceFactID != delivery.FactID || len(task.Deliveries[0].Artifacts) != 2 || task.Deliveries[0].Artifacts[0] != artifactRefs[0] || task.Deliveries[0].Artifacts[1] != artifactRefs[1] {
+		t.Fatalf("Deliveries = %+v", task.Deliveries)
+	}
+	if len(task.OpaqueFacts) != 1 || task.OpaqueFacts[0].SourceFactID != opaque.FactID || task.OpaqueFacts[0].Kind != "adapter.runtime_observation" || !bytes.Equal(task.OpaqueFacts[0].Data, opaqueData) {
+		t.Fatalf("Opaque Facts = %+v", task.OpaqueFacts)
+	}
+	replayedAgain, err := workspace.Replay()
+	if err != nil {
+		t.Fatalf("Replay again: %v", err)
+	}
+	firstJSON, _ := json.Marshal(projection)
+	secondJSON, _ := json.Marshal(replayedAgain)
+	if !bytes.Equal(firstJSON, secondJSON) {
+		t.Fatalf("Replay changed: %s != %s", firstJSON, secondJSON)
+	}
+}
+
+func TestGovernanceDeliveryAndOpaqueRejectionsLeaveLedgerUnchanged(t *testing.T) {
+	otherDigest := "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+	tests := []struct {
+		name string
+		make func(task, artifact, otherTask, otherArtifact mcr.Fact) mcr.Submission
+	}{
+		{"Review missing or forward subject", func(_, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindReviewRecorded, map[string]any{"subject": mcr.FactRef{FactID: "fact_missing", RecordHash: otherDigest}, "outcome": "accepted"})
+		}},
+		{"Review cross Task subject", func(_, _, otherTask, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindReviewRecorded, map[string]any{"subject": mcr.FactRef{FactID: otherTask.FactID, RecordHash: otherTask.RecordHash}, "outcome": "accepted"})
+		}},
+		{"Review subject hash mismatch", func(task, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindReviewRecorded, map[string]any{"subject": mcr.FactRef{FactID: task.FactID, RecordHash: otherDigest}, "outcome": "accepted"})
+		}},
+		{"Review empty outcome", func(task, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindReviewRecorded, map[string]any{"subject": mcr.FactRef{FactID: task.FactID, RecordHash: task.RecordHash}, "outcome": ""})
+		}},
+		{"Review empty findings", func(task, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindReviewRecorded, map[string]any{"subject": mcr.FactRef{FactID: task.FactID, RecordHash: task.RecordHash}, "outcome": "accepted", "findings": ""})
+		}},
+		{"Review null findings", func(task, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindReviewRecorded, map[string]any{"subject": mcr.FactRef{FactID: task.FactID, RecordHash: task.RecordHash}, "outcome": "accepted", "findings": nil})
+		}},
+		{"Review unknown field", func(task, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindReviewRecorded, map[string]any{"subject": mcr.FactRef{FactID: task.FactID, RecordHash: task.RecordHash}, "outcome": "accepted", "extra": true})
+		}},
+		{"Approval missing or forward subject", func(_, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindApprovalRecorded, map[string]any{"subject": mcr.FactRef{FactID: "fact_missing", RecordHash: otherDigest}, "scope": "release", "decision": "approved"})
+		}},
+		{"Approval cross Task subject", func(_, _, otherTask, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindApprovalRecorded, map[string]any{"subject": mcr.FactRef{FactID: otherTask.FactID, RecordHash: otherTask.RecordHash}, "scope": "release", "decision": "approved"})
+		}},
+		{"Approval subject hash mismatch", func(task, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindApprovalRecorded, map[string]any{"subject": mcr.FactRef{FactID: task.FactID, RecordHash: otherDigest}, "scope": "release", "decision": "approved"})
+		}},
+		{"Approval empty scope", func(task, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindApprovalRecorded, map[string]any{"subject": mcr.FactRef{FactID: task.FactID, RecordHash: task.RecordHash}, "scope": "", "decision": "approved"})
+		}},
+		{"Approval empty decision", func(task, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindApprovalRecorded, map[string]any{"subject": mcr.FactRef{FactID: task.FactID, RecordHash: task.RecordHash}, "scope": "release", "decision": ""})
+		}},
+		{"Approval empty note", func(task, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindApprovalRecorded, map[string]any{"subject": mcr.FactRef{FactID: task.FactID, RecordHash: task.RecordHash}, "scope": "release", "decision": "approved", "note": ""})
+		}},
+		{"Approval unknown field", func(task, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindApprovalRecorded, map[string]any{"subject": mcr.FactRef{FactID: task.FactID, RecordHash: task.RecordHash}, "scope": "release", "decision": "approved", "extra": true})
+		}},
+		{"Policy missing or forward subject", func(_, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindPolicyDecisionRecorded, map[string]any{"subject": mcr.FactRef{FactID: "fact_missing", RecordHash: otherDigest}, "action": "prepare", "policy": "p1", "result": "allow"})
+		}},
+		{"Policy cross Task subject", func(_, _, otherTask, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindPolicyDecisionRecorded, map[string]any{"subject": mcr.FactRef{FactID: otherTask.FactID, RecordHash: otherTask.RecordHash}, "action": "prepare", "policy": "p1", "result": "allow"})
+		}},
+		{"Policy subject hash mismatch", func(task, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindPolicyDecisionRecorded, map[string]any{"subject": mcr.FactRef{FactID: task.FactID, RecordHash: otherDigest}, "action": "prepare", "policy": "p1", "result": "allow"})
+		}},
+		{"Policy empty action", func(task, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindPolicyDecisionRecorded, map[string]any{"subject": mcr.FactRef{FactID: task.FactID, RecordHash: task.RecordHash}, "action": "", "policy": "p1", "result": "allow"})
+		}},
+		{"Policy empty policy", func(task, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindPolicyDecisionRecorded, map[string]any{"subject": mcr.FactRef{FactID: task.FactID, RecordHash: task.RecordHash}, "action": "prepare", "policy": "", "result": "allow"})
+		}},
+		{"Policy empty result", func(task, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindPolicyDecisionRecorded, map[string]any{"subject": mcr.FactRef{FactID: task.FactID, RecordHash: task.RecordHash}, "action": "prepare", "policy": "p1", "result": ""})
+		}},
+		{"Policy unknown field", func(task, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindPolicyDecisionRecorded, map[string]any{"subject": mcr.FactRef{FactID: task.FactID, RecordHash: task.RecordHash}, "action": "prepare", "policy": "p1", "result": "allow", "extra": true})
+		}},
+		{"Delivery empty Artifacts", func(_, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindDeliveryRecorded, map[string]any{"artifacts": []mcr.FactRef{}, "format": "zip", "scope": "release", "target": "urn:target"})
+		}},
+		{"Delivery duplicate Artifacts", func(_, artifact, _, _ mcr.Fact) mcr.Submission {
+			ref := mcr.FactRef{FactID: artifact.FactID, RecordHash: artifact.RecordHash}
+			return submission("task-1", mcr.KindDeliveryRecorded, map[string]any{"artifacts": []mcr.FactRef{ref, ref}, "format": "zip", "scope": "release", "target": "urn:target"})
+		}},
+		{"Delivery missing or forward Artifact", func(_, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindDeliveryRecorded, map[string]any{"artifacts": []mcr.FactRef{{FactID: "fact_missing", RecordHash: otherDigest}}, "format": "zip", "scope": "release", "target": "urn:target"})
+		}},
+		{"Delivery cross Task Artifact", func(_, _, _, otherArtifact mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindDeliveryRecorded, map[string]any{"artifacts": []mcr.FactRef{{FactID: otherArtifact.FactID, RecordHash: otherArtifact.RecordHash}}, "format": "zip", "scope": "release", "target": "urn:target"})
+		}},
+		{"Delivery wrong Kind", func(task, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindDeliveryRecorded, map[string]any{"artifacts": []mcr.FactRef{{FactID: task.FactID, RecordHash: task.RecordHash}}, "format": "zip", "scope": "release", "target": "urn:target"})
+		}},
+		{"Delivery hash mismatch", func(_, artifact, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindDeliveryRecorded, map[string]any{"artifacts": []mcr.FactRef{{FactID: artifact.FactID, RecordHash: otherDigest}}, "format": "zip", "scope": "release", "target": "urn:target"})
+		}},
+		{"Delivery empty format", func(_, artifact, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindDeliveryRecorded, map[string]any{"artifacts": []mcr.FactRef{{FactID: artifact.FactID, RecordHash: artifact.RecordHash}}, "format": "", "scope": "release", "target": "urn:target"})
+		}},
+		{"Delivery unknown field", func(_, artifact, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindDeliveryRecorded, map[string]any{"artifacts": []mcr.FactRef{{FactID: artifact.FactID, RecordHash: artifact.RecordHash}}, "format": "zip", "scope": "release", "target": "urn:target", "extra": true})
+		}},
+		{"Opaque empty external Kind", func(_, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindOpaqueRecorded, map[string]any{"kind": "", "data": map[string]any{}})
+		}},
+		{"Opaque non-object data", func(_, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindOpaqueRecorded, map[string]any{"kind": "adapter.event", "data": []string{"not", "object"}})
+		}},
+		{"Opaque unknown wrapper field", func(_, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindOpaqueRecorded, map[string]any{"kind": "adapter.event", "data": map[string]any{}, "extra": true})
+		}},
+		{"Unknown native submission Kind", func(_, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", "adapter.event", map[string]any{})
+		}},
+	}
+	for _, nativeKind := range []string{mcr.KindTaskCreated, mcr.KindRunRecorded, mcr.KindInputRegistered, mcr.KindArtifactRecorded, mcr.KindClaimRecorded, mcr.KindSourceReferenceRecorded, mcr.KindEvidenceLinked, mcr.KindReviewRecorded, mcr.KindApprovalRecorded, mcr.KindPolicyDecisionRecorded, mcr.KindDeliveryRecorded, mcr.KindOpaqueRecorded} {
+		kind := nativeKind
+		tests = append(tests, struct {
+			name string
+			make func(task, artifact, otherTask, otherArtifact mcr.Fact) mcr.Submission
+		}{"Opaque native Kind " + kind, func(_, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindOpaqueRecorded, map[string]any{"kind": kind, "data": map[string]any{}})
+		}})
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			workspace, err := mcr.Create(root, "workspace-invalid-governance")
+			if err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			task, err := workspace.Submit(validTaskSubmission("task-1"))
+			if err != nil {
+				t.Fatalf("Submit Task 1: %v", err)
+			}
+			content := mcr.ContentRef{Locator: "urn:example:artifact", SHA256: digest}
+			artifact, err := workspace.Submit(submission("task-1", mcr.KindArtifactRecorded, map[string]any{"content": content}))
+			if err != nil {
+				t.Fatalf("Submit Artifact: %v", err)
+			}
+			otherTask, err := workspace.Submit(validTaskSubmission("task-2"))
+			if err != nil {
+				t.Fatalf("Submit Task 2: %v", err)
+			}
+			otherArtifact, err := workspace.Submit(submission("task-2", mcr.KindArtifactRecorded, map[string]any{"content": content}))
+			if err != nil {
+				t.Fatalf("Submit other Artifact: %v", err)
+			}
+			ledgerPath := filepath.Join(root, ".mcr", "events.jsonl")
+			before, err := os.ReadFile(ledgerPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := workspace.Submit(test.make(task, artifact, otherTask, otherArtifact)); !errors.Is(err, mcr.ErrInvalidSubmission) {
+				t.Fatalf("Submit error = %v, want ErrInvalidSubmission", err)
+			}
+			after, err := os.ReadFile(ledgerPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(after, before) {
+				t.Fatal("invalid submission changed ledger")
+			}
+		})
+	}
+}
+
 func TestClaimSourceEvidenceRejectionsLeaveLedgerUnchanged(t *testing.T) {
 	content := mcr.ContentRef{Locator: "urn:example:content", SHA256: digest}
 	otherDigest := "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
@@ -699,19 +971,19 @@ func TestNeutralSealedFixture(t *testing.T) {
 		t.Fatal(err)
 	}
 	verification, err := workspace.Verify()
-	if err != nil || verification.Integrity != mcr.IntegritySealedValid || verification.RecordCount != 8 || verification.LastRecordID != "fact_fixture_07" {
+	if err != nil || verification.Integrity != mcr.IntegritySealedValid || verification.RecordCount != 15 || verification.LastRecordID != "fact_fixture_14" {
 		t.Fatalf("Verify fixture = %+v, %v", verification, err)
 	}
 	facts, err := workspace.Query(mcr.FactQuery{})
-	if err != nil || len(facts) != 7 || facts[0].TaskID != "task-neutral" || facts[6].Kind != mcr.KindEvidenceLinked {
+	if err != nil || len(facts) != 14 || facts[0].TaskID != "task-neutral" || facts[13].TaskID != "task-secondary" || facts[13].Kind != mcr.KindTaskCreated {
 		t.Fatalf("Query fixture = %+v, %v", facts, err)
 	}
 	projection, err := workspace.Replay()
-	if err != nil || len(projection.Tasks) != 1 {
+	if err != nil || len(projection.Tasks) != 2 {
 		t.Fatalf("Replay fixture = %+v, %v", projection, err)
 	}
 	task := projection.Tasks[0]
-	if task.Definition.ID != "neutral-task" || len(task.Runs) != 1 || len(task.RegisteredInputs) != 1 || len(task.Artifacts) != 1 || len(task.Claims) != 1 || len(task.SourceReferences) != 1 || len(task.EvidenceLinks) != 1 {
+	if task.Definition.ID != "neutral-task" || len(task.Runs) != 1 || len(task.RegisteredInputs) != 1 || len(task.Artifacts) != 2 || len(task.Claims) != 1 || len(task.SourceReferences) != 1 || len(task.EvidenceLinks) != 1 || len(task.Reviews) != 1 || len(task.Approvals) != 1 || len(task.PolicyDecisions) != 1 || len(task.Deliveries) != 1 || len(task.OpaqueFacts) != 1 {
 		t.Fatalf("Replay fixture Task = %+v", task)
 	}
 	if task.Artifacts[0].Run == nil || task.Artifacts[0].Run.FactID != task.Runs[0].SourceFactID {
@@ -719,6 +991,15 @@ func TestNeutralSealedFixture(t *testing.T) {
 	}
 	if task.Claims[0].OriginArtifact == nil || task.Claims[0].OriginArtifact.FactID != task.Artifacts[0].SourceFactID || task.EvidenceLinks[0].Claim.FactID != task.Claims[0].SourceFactID || task.EvidenceLinks[0].Source.FactID != task.SourceReferences[0].SourceFactID {
 		t.Fatalf("Replay fixture evidence = %+v", task)
+	}
+	if task.Reviews[0].Subject.FactID != task.EvidenceLinks[0].SourceFactID || task.Reviews[0].Findings != "Exact fixture finding." || task.Approvals[0].Subject.FactID != task.Reviews[0].SourceFactID || task.Approvals[0].Note != "" || task.PolicyDecisions[0].Subject.FactID != task.Approvals[0].SourceFactID {
+		t.Fatalf("Replay fixture governance = %+v", task)
+	}
+	if len(task.Deliveries[0].Artifacts) != 2 || task.Deliveries[0].Artifacts[0].FactID != task.Artifacts[0].SourceFactID || task.Deliveries[0].Artifacts[1].FactID != task.Artifacts[1].SourceFactID || task.OpaqueFacts[0].Kind != "adapter.runtime_observation" {
+		t.Fatalf("Replay fixture delivery and opaque Facts = %+v", task)
+	}
+	if projection.Tasks[1].TaskID != "task-secondary" || projection.Tasks[1].Definition.ID != "secondary-task" {
+		t.Fatalf("Replay fixture second Task = %+v", projection.Tasks[1])
 	}
 }
 
@@ -781,6 +1062,25 @@ func TestCLIContracts(t *testing.T) {
 	if err := json.Unmarshal([]byte(evidenceOut), &evidence); err != nil || evidence.Kind != mcr.KindEvidenceLinked {
 		t.Fatalf("Evidence submit stdout = %q, %v", evidenceOut, err)
 	}
+
+	submitKind := func(payload, kind string) mcr.Fact {
+		t.Helper()
+		out, diagnostic, code := runCLI(bin, payload, "submit", "--workspace", root)
+		if code != 0 || diagnostic != "" {
+			t.Fatalf("%s submit exit=%d stderr=%q stdout=%q", kind, code, diagnostic, out)
+		}
+		var submitted mcr.Fact
+		if err := json.Unmarshal([]byte(out), &submitted); err != nil || submitted.Kind != kind {
+			t.Fatalf("%s submit stdout = %q, %v", kind, out, err)
+		}
+		return submitted
+	}
+	review := submitKind(`{"task_id":"task-cli","actor":{"type":"integration","id":"cli-test"},"kind":"review.recorded","payload":{"subject":{"fact_id":"`+evidence.FactID+`","record_hash":"`+evidence.RecordHash+`"},"outcome":"accepted"}}`, mcr.KindReviewRecorded)
+	approval := submitKind(`{"task_id":"task-cli","actor":{"type":"integration","id":"cli-test"},"kind":"approval.recorded","payload":{"subject":{"fact_id":"`+review.FactID+`","record_hash":"`+review.RecordHash+`"},"scope":"release","decision":"approved"}}`, mcr.KindApprovalRecorded)
+	_ = submitKind(`{"task_id":"task-cli","actor":{"type":"integration","id":"cli-test"},"kind":"policy_decision.recorded","payload":{"subject":{"fact_id":"`+approval.FactID+`","record_hash":"`+approval.RecordHash+`"},"action":"prepare","policy":"external-v1","result":"allow"}}`, mcr.KindPolicyDecisionRecorded)
+	artifact := submitKind(`{"task_id":"task-cli","actor":{"type":"integration","id":"cli-test"},"kind":"artifact.recorded","payload":{"content":{"locator":"urn:example:cli-artifact","sha256":"`+digest+`"}}}`, mcr.KindArtifactRecorded)
+	_ = submitKind(`{"task_id":"task-cli","actor":{"type":"integration","id":"cli-test"},"kind":"delivery.recorded","payload":{"artifacts":[{"fact_id":"`+artifact.FactID+`","record_hash":"`+artifact.RecordHash+`"}],"format":"application/zip","scope":"release","target":"urn:example:target"}}`, mcr.KindDeliveryRecorded)
+	_ = submitKind(`{"task_id":"task-cli","actor":{"type":"integration","id":"cli-test"},"kind":"opaque.recorded","payload":{"kind":"adapter.runtime_observation","data":{"session":"external"}}}`, mcr.KindOpaqueRecorded)
 
 	duplicate := `{"task_id":"task-shadow","task_id":"task-duplicate","actor":{"type":"integration","id":"cli-test"},"kind":"task.created","payload":{"definition":{"namespace":"example.test","id":"duplicate","version":"v1","locator":"urn:example:duplicate:v1","sha256":"` + digest + `"}}}`
 	duplicateOut, duplicateErr, duplicateExit := runCLI(bin, duplicate, "submit", "--workspace", root)

@@ -14,6 +14,11 @@ const (
 	KindClaimRecorded           = "claim.recorded"
 	KindSourceReferenceRecorded = "source_reference.recorded"
 	KindEvidenceLinked          = "evidence.linked"
+	KindReviewRecorded          = "review.recorded"
+	KindApprovalRecorded        = "approval.recorded"
+	KindPolicyDecisionRecorded  = "policy_decision.recorded"
+	KindDeliveryRecorded        = "delivery.recorded"
+	KindOpaqueRecorded          = "opaque.recorded"
 	IntegritySealedValid        = "sealed_valid"
 	FormatNative                = "mcr-core/v1"
 )
@@ -97,6 +102,11 @@ type TaskProjection struct {
 	Claims           []ClaimProjection           `json:"claims"`
 	SourceReferences []SourceReferenceProjection `json:"source_references"`
 	EvidenceLinks    []EvidenceLinkProjection    `json:"evidence_links"`
+	Reviews          []ReviewProjection          `json:"reviews"`
+	Approvals        []ApprovalProjection        `json:"approvals"`
+	PolicyDecisions  []PolicyDecisionProjection  `json:"policy_decisions"`
+	Deliveries       []DeliveryProjection        `json:"deliveries"`
+	OpaqueFacts      []OpaqueFactProjection      `json:"opaque_facts"`
 }
 
 type RunProjection struct {
@@ -133,6 +143,43 @@ type EvidenceLinkProjection struct {
 	SourceFactID string  `json:"source_fact_id"`
 	Claim        FactRef `json:"claim"`
 	Source       FactRef `json:"source"`
+}
+
+type ReviewProjection struct {
+	SourceFactID string  `json:"source_fact_id"`
+	Subject      FactRef `json:"subject"`
+	Outcome      string  `json:"outcome"`
+	Findings     string  `json:"findings,omitempty"`
+}
+
+type ApprovalProjection struct {
+	SourceFactID string  `json:"source_fact_id"`
+	Subject      FactRef `json:"subject"`
+	Scope        string  `json:"scope"`
+	Decision     string  `json:"decision"`
+	Note         string  `json:"note,omitempty"`
+}
+
+type PolicyDecisionProjection struct {
+	SourceFactID string  `json:"source_fact_id"`
+	Subject      FactRef `json:"subject"`
+	Action       string  `json:"action"`
+	Policy       string  `json:"policy"`
+	Result       string  `json:"result"`
+}
+
+type DeliveryProjection struct {
+	SourceFactID string    `json:"source_fact_id"`
+	Artifacts    []FactRef `json:"artifacts"`
+	Format       string    `json:"format"`
+	Scope        string    `json:"scope"`
+	Target       string    `json:"target"`
+}
+
+type OpaqueFactProjection struct {
+	SourceFactID string          `json:"source_fact_id"`
+	Kind         string          `json:"kind"`
+	Data         json.RawMessage `json:"data"`
 }
 
 type Diagnostic struct {
