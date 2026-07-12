@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	mcr "github.com/Notyet1307/MCR-Core"
 )
@@ -33,6 +34,227 @@ func validTaskSubmission(taskID string) mcr.Submission {
 		Actor:   mcr.Actor{Type: "integration", ID: "test-host"},
 		Kind:    mcr.KindTaskCreated,
 		Payload: payload,
+	}
+}
+
+func submission(taskID, kind string, payload any) mcr.Submission {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		panic(err)
+	}
+	return mcr.Submission{TaskID: taskID, Actor: mcr.Actor{Type: "integration", ID: "test-host"}, Kind: kind, Payload: raw}
+}
+
+func TestRunRoundTrip(t *testing.T) {
+	workspace, err := mcr.Create(t.TempDir(), "workspace-runs")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := workspace.Submit(validTaskSubmission("task-1")); err != nil {
+		t.Fatalf("Submit task: %v", err)
+	}
+
+	run, err := workspace.Submit(mcr.Submission{
+		TaskID:  "task-1",
+		Actor:   mcr.Actor{Type: "integration", ID: "test-host"},
+		Kind:    mcr.KindRunRecorded,
+		Payload: json.RawMessage(`{"started_at":"2026-07-12T08:00:00Z","ended_at":"2026-07-12T08:01:00Z","outcome":"completed"}`),
+	})
+	if err != nil {
+		t.Fatalf("Submit run: %v", err)
+	}
+	facts, err := workspace.Query(mcr.FactQuery{TaskID: "task-1", Kind: mcr.KindRunRecorded})
+	if err != nil || len(facts) != 1 || facts[0].FactID != run.FactID {
+		t.Fatalf("Query runs = %+v, %v", facts, err)
+	}
+	projection, err := workspace.Replay()
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	wantStart := time.Date(2026, 7, 12, 8, 0, 0, 0, time.UTC)
+	if len(projection.Tasks) != 1 || len(projection.Tasks[0].Runs) != 1 {
+		t.Fatalf("Replay = %+v", projection)
+	}
+	got := projection.Tasks[0].Runs[0]
+	if got.SourceFactID != run.FactID || !got.StartedAt.Equal(wantStart) || got.Outcome != "completed" {
+		t.Fatalf("projected Run = %+v", got)
+	}
+}
+
+func TestRegisteredInputsAndArtifactsRoundTrip(t *testing.T) {
+	workspace, err := mcr.Create(t.TempDir(), "workspace-content")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := workspace.Submit(validTaskSubmission("task-1")); err != nil {
+		t.Fatalf("Submit task: %v", err)
+	}
+	run, err := workspace.Submit(submission("task-1", mcr.KindRunRecorded, map[string]any{
+		"started_at": "2026-07-12T08:00:00Z", "ended_at": "2026-07-12T08:01:00Z", "outcome": "completed",
+	}))
+	if err != nil {
+		t.Fatalf("Submit run: %v", err)
+	}
+	content := mcr.ContentRef{Locator: "urn:example:content", SHA256: digest}
+	input1, err := workspace.Submit(submission("task-1", mcr.KindInputRegistered, map[string]any{"content": content}))
+	if err != nil {
+		t.Fatalf("Submit input: %v", err)
+	}
+	input2, err := workspace.Submit(submission("task-1", mcr.KindInputRegistered, map[string]any{"content": content}))
+	if err != nil {
+		t.Fatalf("Submit repeated input: %v", err)
+	}
+	withoutRun, err := workspace.Submit(submission("task-1", mcr.KindArtifactRecorded, map[string]any{"content": content}))
+	if err != nil {
+		t.Fatalf("Submit artifact without Run: %v", err)
+	}
+	withRun, err := workspace.Submit(submission("task-1", mcr.KindArtifactRecorded, map[string]any{
+		"content": content, "run": mcr.FactRef{FactID: run.FactID, RecordHash: run.RecordHash},
+	}))
+	if err != nil {
+		t.Fatalf("Submit artifact with Run: %v", err)
+	}
+	if input1.FactID == input2.FactID {
+		t.Fatal("repeated content reused Fact identity")
+	}
+
+	facts, err := workspace.Query(mcr.FactQuery{TaskID: "task-1"})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	wantIDs := []string{run.FactID, input1.FactID, input2.FactID, withoutRun.FactID, withRun.FactID}
+	for i, want := range wantIDs {
+		if facts[i+1].FactID != want {
+			t.Fatalf("Query order = %+v", facts)
+		}
+	}
+	projection, err := workspace.Replay()
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	task := projection.Tasks[0]
+	if len(task.RegisteredInputs) != 2 || task.RegisteredInputs[0].SourceFactID != input1.FactID || task.RegisteredInputs[0].Content != content {
+		t.Fatalf("Registered Inputs = %+v", task.RegisteredInputs)
+	}
+	if len(task.Artifacts) != 2 || task.Artifacts[0].SourceFactID != withoutRun.FactID || task.Artifacts[0].Run != nil {
+		t.Fatalf("Artifacts = %+v", task.Artifacts)
+	}
+	wantRun := mcr.FactRef{FactID: run.FactID, RecordHash: run.RecordHash}
+	if task.Artifacts[1].SourceFactID != withRun.FactID || task.Artifacts[1].Content != content || task.Artifacts[1].Run == nil || *task.Artifacts[1].Run != wantRun {
+		t.Fatalf("Artifact provenance = %+v", task.Artifacts[1])
+	}
+}
+
+func TestRunInputArtifactRejectionsLeaveLedgerUnchanged(t *testing.T) {
+	validRun := map[string]any{"started_at": "2026-07-12T08:00:00Z", "ended_at": "2026-07-12T08:01:00Z", "outcome": "completed"}
+	content := mcr.ContentRef{Locator: "urn:example:content", SHA256: digest}
+	otherDigest := "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+
+	tests := []struct {
+		name string
+		make func(run, input, otherRun mcr.Fact) mcr.Submission
+	}{
+		{"missing Task", func(_, _, _ mcr.Fact) mcr.Submission { return submission("missing", mcr.KindRunRecorded, validRun) }},
+		{"empty Run outcome", func(_, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindRunRecorded, map[string]any{"started_at": "2026-07-12T08:00:00Z", "ended_at": "2026-07-12T08:01:00Z", "outcome": ""})
+		}},
+		{"Run unknown field", func(_, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindRunRecorded, map[string]any{"started_at": "2026-07-12T08:00:00Z", "ended_at": "2026-07-12T08:01:00Z", "outcome": "ok", "model": "external"})
+		}},
+		{"Run wrong type", func(_, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindRunRecorded, map[string]any{"started_at": 1, "ended_at": "2026-07-12T08:01:00Z", "outcome": "ok"})
+		}},
+		{"Run non UTC", func(_, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindRunRecorded, map[string]any{"started_at": "2026-07-12T10:00:00+02:00", "ended_at": "2026-07-12T10:01:00+02:00", "outcome": "ok"})
+		}},
+		{"Run invalid timestamp", func(_, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindRunRecorded, map[string]any{"started_at": "not-time", "ended_at": "2026-07-12T08:01:00Z", "outcome": "ok"})
+		}},
+		{"Run end before start", func(_, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindRunRecorded, map[string]any{"started_at": "2026-07-12T08:01:00Z", "ended_at": "2026-07-12T08:00:00Z", "outcome": "ok"})
+		}},
+		{"Input empty locator", func(_, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindInputRegistered, map[string]any{"content": mcr.ContentRef{SHA256: digest}})
+		}},
+		{"Input invalid hash", func(_, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindInputRegistered, map[string]any{"content": mcr.ContentRef{Locator: "urn:x", SHA256: "0123"}})
+		}},
+		{"Input unknown field", func(_, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindInputRegistered, map[string]any{"content": content, "name": "external"})
+		}},
+		{"Input wrong type", func(_, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindInputRegistered, map[string]any{"content": "urn:x"})
+		}},
+		{"Artifact invalid content", func(_, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindArtifactRecorded, map[string]any{"content": mcr.ContentRef{Locator: "urn:x", SHA256: "bad"}})
+		}},
+		{"Artifact unknown field", func(_, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindArtifactRecorded, map[string]any{"content": content, "format": "external"})
+		}},
+		{"Artifact null Run", func(_, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindArtifactRecorded, map[string]any{"content": content, "run": nil})
+		}},
+		{"Artifact Run wrong type", func(_, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindArtifactRecorded, map[string]any{"content": content, "run": "fact"})
+		}},
+		{"Artifact Run unknown field", func(run, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindArtifactRecorded, map[string]any{"content": content, "run": map[string]any{"fact_id": run.FactID, "record_hash": run.RecordHash, "workspace": "other"}})
+		}},
+		{"Artifact missing or forward Run", func(_, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindArtifactRecorded, map[string]any{"content": content, "run": mcr.FactRef{FactID: "fact_missing", RecordHash: otherDigest}})
+		}},
+		{"Artifact cross Task Run", func(_, _, otherRun mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindArtifactRecorded, map[string]any{"content": content, "run": mcr.FactRef{FactID: otherRun.FactID, RecordHash: otherRun.RecordHash}})
+		}},
+		{"Artifact wrong Kind", func(_, input, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindArtifactRecorded, map[string]any{"content": content, "run": mcr.FactRef{FactID: input.FactID, RecordHash: input.RecordHash}})
+		}},
+		{"Artifact hash mismatch", func(run, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindArtifactRecorded, map[string]any{"content": content, "run": mcr.FactRef{FactID: run.FactID, RecordHash: otherDigest}})
+		}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			workspace, err := mcr.Create(root, "workspace-invalid")
+			if err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			if _, err := workspace.Submit(validTaskSubmission("task-1")); err != nil {
+				t.Fatalf("Submit task 1: %v", err)
+			}
+			run, err := workspace.Submit(submission("task-1", mcr.KindRunRecorded, validRun))
+			if err != nil {
+				t.Fatalf("Submit Run: %v", err)
+			}
+			input, err := workspace.Submit(submission("task-1", mcr.KindInputRegistered, map[string]any{"content": content}))
+			if err != nil {
+				t.Fatalf("Submit Input: %v", err)
+			}
+			if _, err := workspace.Submit(validTaskSubmission("task-2")); err != nil {
+				t.Fatalf("Submit task 2: %v", err)
+			}
+			otherRun, err := workspace.Submit(submission("task-2", mcr.KindRunRecorded, validRun))
+			if err != nil {
+				t.Fatalf("Submit other Run: %v", err)
+			}
+			ledgerPath := filepath.Join(root, ".mcr", "events.jsonl")
+			before, err := os.ReadFile(ledgerPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := workspace.Submit(test.make(run, input, otherRun)); !errors.Is(err, mcr.ErrInvalidSubmission) {
+				t.Fatalf("Submit error = %v, want ErrInvalidSubmission", err)
+			}
+			after, err := os.ReadFile(ledgerPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(after, before) {
+				t.Fatal("invalid submission changed ledger")
+			}
+		})
 	}
 }
 
@@ -239,16 +461,23 @@ func TestNeutralSealedFixture(t *testing.T) {
 		t.Fatal(err)
 	}
 	verification, err := workspace.Verify()
-	if err != nil || verification.Integrity != mcr.IntegritySealedValid || verification.LastRecordID != "fact_fixture_01" {
+	if err != nil || verification.Integrity != mcr.IntegritySealedValid || verification.RecordCount != 5 || verification.LastRecordID != "fact_fixture_04" {
 		t.Fatalf("Verify fixture = %+v, %v", verification, err)
 	}
 	facts, err := workspace.Query(mcr.FactQuery{})
-	if err != nil || len(facts) != 1 || facts[0].TaskID != "task-neutral" {
+	if err != nil || len(facts) != 4 || facts[0].TaskID != "task-neutral" || facts[3].Kind != mcr.KindArtifactRecorded {
 		t.Fatalf("Query fixture = %+v, %v", facts, err)
 	}
 	projection, err := workspace.Replay()
-	if err != nil || len(projection.Tasks) != 1 || projection.Tasks[0].Definition.ID != "neutral-task" {
+	if err != nil || len(projection.Tasks) != 1 {
 		t.Fatalf("Replay fixture = %+v, %v", projection, err)
+	}
+	task := projection.Tasks[0]
+	if task.Definition.ID != "neutral-task" || len(task.Runs) != 1 || len(task.RegisteredInputs) != 1 || len(task.Artifacts) != 1 {
+		t.Fatalf("Replay fixture Task = %+v", task)
+	}
+	if task.Artifacts[0].Run == nil || task.Artifacts[0].Run.FactID != task.Runs[0].SourceFactID {
+		t.Fatalf("Replay fixture provenance = %+v", task.Artifacts[0])
 	}
 }
 
@@ -271,6 +500,16 @@ func TestCLIContracts(t *testing.T) {
 	var fact mcr.Fact
 	if err := json.Unmarshal([]byte(stdout), &fact); err != nil || fact.TaskID != "task-cli" {
 		t.Fatalf("submit stdout = %q, %v", stdout, err)
+	}
+
+	runPayload := `{"task_id":"task-cli","actor":{"type":"integration","id":"cli-test"},"kind":"run.recorded","payload":{"started_at":"2026-07-12T08:00:00Z","ended_at":"2026-07-12T08:01:00Z","outcome":"completed"}}`
+	runOut, runErr, runExit := runCLI(bin, runPayload, "submit", "--workspace", root)
+	if runExit != 0 || runErr != "" {
+		t.Fatalf("Run submit exit=%d stderr=%q stdout=%q", runExit, runErr, runOut)
+	}
+	var run mcr.Fact
+	if err := json.Unmarshal([]byte(runOut), &run); err != nil || run.Kind != mcr.KindRunRecorded || run.FactID == fact.FactID {
+		t.Fatalf("Run submit stdout = %q, %v", runOut, err)
 	}
 
 	duplicate := `{"task_id":"task-shadow","task_id":"task-duplicate","actor":{"type":"integration","id":"cli-test"},"kind":"task.created","payload":{"definition":{"namespace":"example.test","id":"duplicate","version":"v1","locator":"urn:example:duplicate:v1","sha256":"` + digest + `"}}}`

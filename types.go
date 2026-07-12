@@ -8,6 +8,9 @@ import (
 
 const (
 	KindTaskCreated      = "task.created"
+	KindRunRecorded      = "run.recorded"
+	KindInputRegistered  = "input.registered"
+	KindArtifactRecorded = "artifact.recorded"
 	IntegritySealedValid = "sealed_valid"
 	FormatNative         = "mcr-core/v1"
 )
@@ -36,6 +39,16 @@ type DefinitionRef struct {
 	Version   string `json:"version"`
 	Locator   string `json:"locator"`
 	SHA256    string `json:"sha256"`
+}
+
+type ContentRef struct {
+	Locator string `json:"locator"`
+	SHA256  string `json:"sha256"`
+}
+
+type FactRef struct {
+	FactID     string `json:"fact_id"`
+	RecordHash string `json:"record_hash"`
 }
 
 type Submission struct {
@@ -72,9 +85,30 @@ type Projection struct {
 }
 
 type TaskProjection struct {
-	TaskID       string        `json:"task_id"`
-	SourceFactID string        `json:"source_fact_id"`
-	Definition   DefinitionRef `json:"definition"`
+	TaskID           string                      `json:"task_id"`
+	SourceFactID     string                      `json:"source_fact_id"`
+	Definition       DefinitionRef               `json:"definition"`
+	Runs             []RunProjection             `json:"runs"`
+	RegisteredInputs []RegisteredInputProjection `json:"registered_inputs"`
+	Artifacts        []ArtifactProjection        `json:"artifacts"`
+}
+
+type RunProjection struct {
+	SourceFactID string    `json:"source_fact_id"`
+	StartedAt    time.Time `json:"started_at"`
+	EndedAt      time.Time `json:"ended_at"`
+	Outcome      string    `json:"outcome"`
+}
+
+type RegisteredInputProjection struct {
+	SourceFactID string     `json:"source_fact_id"`
+	Content      ContentRef `json:"content"`
+}
+
+type ArtifactProjection struct {
+	SourceFactID string     `json:"source_fact_id"`
+	Content      ContentRef `json:"content"`
+	Run          *FactRef   `json:"run,omitempty"`
 }
 
 type Diagnostic struct {

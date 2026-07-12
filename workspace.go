@@ -47,7 +47,68 @@ type factRecord struct {
 type history struct {
 	header workspaceHeader
 	facts  []Fact
-	defs   []DefinitionRef
+}
+
+type runPayload struct {
+	StartedAt time.Time `json:"started_at"`
+	EndedAt   time.Time `json:"ended_at"`
+	Outcome   string    `json:"outcome"`
+}
+
+type artifactPayload struct {
+	Content ContentRef
+	Run     *FactRef
+}
+
+type nativeState struct {
+	tasks map[string]bool
+	facts map[string]Fact
+}
+
+func newNativeState(facts []Fact) nativeState {
+	state := nativeState{tasks: make(map[string]bool), facts: make(map[string]Fact, len(facts))}
+	for _, fact := range facts {
+		state.add(fact)
+	}
+	return state
+}
+
+func (s *nativeState) add(fact Fact) {
+	s.facts[fact.FactID] = fact
+	if fact.Kind == KindTaskCreated {
+		s.tasks[fact.TaskID] = true
+	}
+}
+
+func (s *nativeState) validate(taskID, kind string, payload json.RawMessage) (string, error) {
+	switch kind {
+	case KindTaskCreated, KindRunRecorded, KindInputRegistered, KindArtifactRecorded:
+	default:
+		return "unknown_kind", errors.New("native fact kind is not supported")
+	}
+	taskExists := s.tasks[taskID]
+	if kind != KindTaskCreated && !taskExists {
+		return "invalid_payload", errors.New("task does not exist")
+	}
+	var err error
+	switch kind {
+	case KindTaskCreated:
+		if taskExists {
+			return "duplicate_task", errors.New("task already exists")
+		}
+		_, err = decodeTaskPayload(payload)
+	case KindRunRecorded:
+		_, err = decodeRunPayload(payload)
+	case KindInputRegistered:
+		_, err = decodeInputPayload(payload)
+	case KindArtifactRecorded:
+		var artifact artifactPayload
+		artifact, err = decodeArtifactPayload(payload)
+		if err == nil {
+			err = validateArtifactRun(taskID, artifact.Run, s.facts)
+		}
+	}
+	return "invalid_payload", err
 }
 
 func Create(path, workspaceID string) (*Workspace, error) {
@@ -198,9 +259,30 @@ func (w *Workspace) Replay() (Projection, error) {
 		return Projection{}, fmt.Errorf("%w: workspace ledger is not valid", ErrInvalidHistory)
 	}
 	projection := Projection{WorkspaceID: h.header.WorkspaceID, Format: "native", Integrity: IntegritySealedValid, Tasks: make([]TaskProjection, 0, len(h.facts))}
-	for i, fact := range h.facts {
-		if fact.Kind == KindTaskCreated {
-			projection.Tasks = append(projection.Tasks, TaskProjection{TaskID: fact.TaskID, SourceFactID: fact.FactID, Definition: h.defs[i]})
+	taskIndexes := make(map[string]int)
+	for _, fact := range h.facts {
+		switch fact.Kind {
+		case KindTaskCreated:
+			definition, _ := decodeTaskPayload(fact.Payload)
+			taskIndexes[fact.TaskID] = len(projection.Tasks)
+			projection.Tasks = append(projection.Tasks, TaskProjection{
+				TaskID: fact.TaskID, SourceFactID: fact.FactID, Definition: definition,
+				Runs: []RunProjection{}, RegisteredInputs: []RegisteredInputProjection{}, Artifacts: []ArtifactProjection{},
+			})
+		case KindRunRecorded:
+			payload, _ := decodeRunPayload(fact.Payload)
+			task := &projection.Tasks[taskIndexes[fact.TaskID]]
+			task.Runs = append(task.Runs, RunProjection{
+				SourceFactID: fact.FactID, StartedAt: payload.StartedAt, EndedAt: payload.EndedAt, Outcome: payload.Outcome,
+			})
+		case KindInputRegistered:
+			content, _ := decodeInputPayload(fact.Payload)
+			task := &projection.Tasks[taskIndexes[fact.TaskID]]
+			task.RegisteredInputs = append(task.RegisteredInputs, RegisteredInputProjection{SourceFactID: fact.FactID, Content: content})
+		case KindArtifactRecorded:
+			payload, _ := decodeArtifactPayload(fact.Payload)
+			task := &projection.Tasks[taskIndexes[fact.TaskID]]
+			task.Artifacts = append(task.Artifacts, ArtifactProjection{SourceFactID: fact.FactID, Content: payload.Content, Run: payload.Run})
 		}
 	}
 	return projection, nil
@@ -259,8 +341,8 @@ func parseNative(data []byte) (history, Verification) {
 		return history{}, invalidVerificationWithCount("record_hash_mismatch", 1, header.WorkspaceID, "workspace header hash does not match", len(lines))
 	}
 
-	h := history{header: header, facts: make([]Fact, 0, len(lines)-1), defs: make([]DefinitionRef, 0, len(lines)-1)}
-	knownTasks := make(map[string]bool)
+	h := history{header: header, facts: make([]Fact, 0, len(lines)-1)}
+	state := newNativeState(nil)
 	previousHash := header.RecordHash
 	lastID := header.WorkspaceID
 	for i := 1; i < len(lines); i++ {
@@ -292,19 +374,12 @@ func parseNative(data []byte) (history, Verification) {
 		if record.RecordHash != expectedHash {
 			return history{}, invalidVerificationWithCount("record_hash_mismatch", number, record.FactID, "fact hash does not match", len(lines))
 		}
-		if record.Kind != KindTaskCreated {
-			return history{}, invalidVerificationWithCount("unknown_kind", number, record.FactID, "native fact kind is not supported", len(lines))
-		}
-		if knownTasks[record.TaskID] {
-			return history{}, invalidVerificationWithCount("duplicate_task", number, record.FactID, "task already exists", len(lines))
-		}
-		definition, err := decodeTaskPayload(record.Payload)
+		code, err := state.validate(record.TaskID, record.Kind, record.Payload)
 		if err != nil {
-			return history{}, invalidVerificationWithCount("invalid_payload", number, record.FactID, err.Error(), len(lines))
+			return history{}, invalidVerificationWithCount(code, number, record.FactID, err.Error(), len(lines))
 		}
-		knownTasks[record.TaskID] = true
 		h.facts = append(h.facts, record.fact())
-		h.defs = append(h.defs, definition)
+		state.add(h.facts[len(h.facts)-1])
 		previousHash = record.RecordHash
 		lastID = record.FactID
 	}
@@ -318,18 +393,9 @@ func validateSubmission(submission Submission, h history) error {
 	if submission.TaskID == "" || submission.Actor.Type == "" || submission.Actor.ID == "" || submission.Kind == "" {
 		return fmt.Errorf("%w: task ID, actor, and kind are required", ErrInvalidSubmission)
 	}
-	for _, fact := range h.facts {
-		if fact.TaskID == submission.TaskID {
-			if submission.Kind == KindTaskCreated {
-				return fmt.Errorf("%w: task %q already exists", ErrInvalidSubmission, submission.TaskID)
-			}
-			return fmt.Errorf("%w: kind %q is not supported in this slice", ErrInvalidSubmission, submission.Kind)
-		}
-	}
-	if submission.Kind != KindTaskCreated {
-		return fmt.Errorf("%w: task %q must begin with %s", ErrInvalidSubmission, submission.TaskID, KindTaskCreated)
-	}
-	if _, err := decodeTaskPayload(submission.Payload); err != nil {
+	state := newNativeState(h.facts)
+	_, err := state.validate(submission.TaskID, submission.Kind, submission.Payload)
+	if err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidSubmission, err)
 	}
 	return nil
@@ -350,6 +416,98 @@ func decodeTaskPayload(raw json.RawMessage) (DefinitionRef, error) {
 		return DefinitionRef{}, errors.New("definition requires namespace, id, version, locator, and native sha256")
 	}
 	return d, nil
+}
+
+func decodeRunPayload(raw json.RawMessage) (runPayload, error) {
+	if err := jsonstrict.Validate(raw); err != nil {
+		return runPayload{}, err
+	}
+	var encoded struct {
+		StartedAt string `json:"started_at"`
+		EndedAt   string `json:"ended_at"`
+		Outcome   string `json:"outcome"`
+	}
+	if err := strictDecode(raw, &encoded); err != nil {
+		return runPayload{}, fmt.Errorf("invalid run payload: %w", err)
+	}
+	if encoded.Outcome == "" || !validUTCTimestamp(encoded.StartedAt) || !validUTCTimestamp(encoded.EndedAt) {
+		return runPayload{}, errors.New("run requires UTC start and end timestamps and a non-empty outcome")
+	}
+	startedAt, _ := time.Parse(time.RFC3339Nano, encoded.StartedAt)
+	endedAt, _ := time.Parse(time.RFC3339Nano, encoded.EndedAt)
+	if endedAt.Before(startedAt) {
+		return runPayload{}, errors.New("run end cannot precede start")
+	}
+	return runPayload{StartedAt: startedAt, EndedAt: endedAt, Outcome: encoded.Outcome}, nil
+}
+
+func decodeInputPayload(raw json.RawMessage) (ContentRef, error) {
+	if err := jsonstrict.Validate(raw); err != nil {
+		return ContentRef{}, err
+	}
+	var payload struct {
+		Content ContentRef `json:"content"`
+	}
+	if err := strictDecode(raw, &payload); err != nil {
+		return ContentRef{}, fmt.Errorf("invalid input payload: %w", err)
+	}
+	if err := validateContentRef(payload.Content); err != nil {
+		return ContentRef{}, err
+	}
+	return payload.Content, nil
+}
+
+func decodeArtifactPayload(raw json.RawMessage) (artifactPayload, error) {
+	if err := jsonstrict.Validate(raw); err != nil {
+		return artifactPayload{}, err
+	}
+	var encoded struct {
+		Content ContentRef      `json:"content"`
+		Run     json.RawMessage `json:"run"`
+	}
+	if err := strictDecode(raw, &encoded); err != nil {
+		return artifactPayload{}, fmt.Errorf("invalid artifact payload: %w", err)
+	}
+	if err := validateContentRef(encoded.Content); err != nil {
+		return artifactPayload{}, err
+	}
+	payload := artifactPayload{Content: encoded.Content}
+	if len(encoded.Run) == 0 {
+		return payload, nil
+	}
+	var ref FactRef
+	if err := strictDecode(encoded.Run, &ref); err != nil || ref.FactID == "" || !nativeHash.MatchString(ref.RecordHash) {
+		return artifactPayload{}, errors.New("artifact run must be an exact Fact Reference")
+	}
+	payload.Run = &ref
+	return payload, nil
+}
+
+func validateArtifactRun(taskID string, ref *FactRef, prior map[string]Fact) error {
+	if ref == nil {
+		return nil
+	}
+	fact, found := prior[ref.FactID]
+	if !found {
+		return errors.New("artifact run does not reference an earlier Fact")
+	}
+	if fact.TaskID != taskID {
+		return errors.New("artifact run must belong to the same Task")
+	}
+	if fact.Kind != KindRunRecorded {
+		return errors.New("artifact run must reference a Run")
+	}
+	if fact.RecordHash != ref.RecordHash {
+		return errors.New("artifact run record hash does not match")
+	}
+	return nil
+}
+
+func validateContentRef(content ContentRef) error {
+	if content.Locator == "" || !nativeHash.MatchString(content.SHA256) {
+		return errors.New("content requires a locator and native sha256")
+	}
+	return nil
 }
 
 func (w *Workspace) appendRecord(line []byte) error {
