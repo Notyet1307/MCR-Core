@@ -1,6 +1,7 @@
 package mcr
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -22,6 +24,8 @@ import (
 const zeroHash = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
 
 var nativeHash = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+
+var beforeLedgerReplace = func() error { return nil }
 
 type workspaceHeader struct {
 	RecordType    string `json:"record_type"`
@@ -212,12 +216,30 @@ func Create(path, workspaceID string) (*Workspace, error) {
 	if err != nil {
 		return nil, err
 	}
+	rootLock, err := lockDirectory(root, true)
+	if err != nil {
+		return nil, err
+	}
+	defer unlockDirectory(rootLock)
+
 	mcrDir := filepath.Join(root, ".mcr")
 	if err := os.Mkdir(mcrDir, 0o700); err != nil {
 		if errors.Is(err, os.ErrExist) {
 			return nil, fmt.Errorf("%w: %s already exists", ErrConflict, mcrDir)
 		}
 		return nil, fmt.Errorf("create workspace: %w", err)
+	}
+	storage, err := openDirectory(mcrDir)
+	if err != nil {
+		return nil, fmt.Errorf("open workspace storage: %w", err)
+	}
+	if err = storage.Chmod(0o700); err == nil {
+		err = storage.Close()
+	} else {
+		_ = storage.Close()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("set workspace storage permissions: %w", err)
 	}
 
 	recordedAt := time.Now().UTC().Format(time.RFC3339Nano)
@@ -243,12 +265,21 @@ func Create(path, workspaceID string) (*Workspace, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create ledger: %w", err)
 	}
-	if _, err = ledger.Write(append(line, '\n')); err == nil {
+	if err = ledger.Chmod(0o600); err == nil {
+		_, err = ledger.Write(append(line, '\n'))
+	}
+	if err == nil {
 		err = ledger.Sync()
 	}
 	closeErr := ledger.Close()
 	if err == nil {
 		err = closeErr
+	}
+	if err == nil {
+		err = syncDirectory(mcrDir)
+	}
+	if err == nil {
+		err = syncDirectory(root)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("initialize ledger: %w", err)
@@ -276,6 +307,11 @@ func Open(path string) (*Workspace, error) {
 
 func (w *Workspace) Submit(submission Submission) (Fact, error) {
 	var zero Fact
+	lock, err := w.lock(true)
+	if err != nil {
+		return zero, err
+	}
+	defer unlockDirectory(lock)
 
 	h, verification, err := w.readHistory()
 	if err != nil {
@@ -325,6 +361,12 @@ func (w *Workspace) Submit(submission Submission) (Fact, error) {
 }
 
 func (w *Workspace) Query(query FactQuery) ([]Fact, error) {
+	lock, err := w.lock(false)
+	if err != nil {
+		return nil, err
+	}
+	defer unlockDirectory(lock)
+
 	h, verification, err := w.readHistory()
 	if err != nil {
 		return nil, err
@@ -344,6 +386,12 @@ func (w *Workspace) Query(query FactQuery) ([]Fact, error) {
 }
 
 func (w *Workspace) Replay() (Projection, error) {
+	lock, err := w.lock(false)
+	if err != nil {
+		return Projection{}, err
+	}
+	defer unlockDirectory(lock)
+
 	h, verification, err := w.readHistory()
 	if err != nil {
 		return Projection{}, err
@@ -417,46 +465,62 @@ func (w *Workspace) Replay() (Projection, error) {
 }
 
 func (w *Workspace) Verify() (Verification, error) {
+	lock, err := w.lock(false)
+	if err != nil {
+		return Verification{}, err
+	}
+	defer unlockDirectory(lock)
+
 	_, verification, err := w.readHistory()
 	return verification, err
 }
 
 func (w *Workspace) readHistory() (history, Verification, error) {
 	ledgerPath := filepath.Join(w.path, ".mcr", "events.jsonl")
-	data, err := os.ReadFile(ledgerPath)
+	ledger, _, err := openRegular(ledgerPath)
+	if err != nil {
+		return history{}, Verification{}, err
+	}
+	defer ledger.Close()
+	h, verification, err := parseNative(ledger)
 	if err != nil {
 		return history{}, Verification{}, fmt.Errorf("read workspace ledger: %w", err)
 	}
-	h, verification := parseNative(data)
 	return h, verification, nil
 }
 
-func parseNative(data []byte) (history, Verification) {
+func parseNative(ledger io.ReadSeeker) (history, Verification, error) {
 	v := Verification{Format: "native", Diagnostics: []Diagnostic{}}
-	if !utf8.Valid(data) || bytes.HasPrefix(data, []byte{0xef, 0xbb, 0xbf}) {
-		return history{}, invalidVerification("invalid_encoding", 0, "", "ledger must be UTF-8 without BOM")
+	recordCount, blankLine, invalidEncoding, missingNewline, err := inspectNativeRecords(ledger)
+	if err != nil {
+		return history{}, Verification{}, err
 	}
-	if len(data) == 0 || data[len(data)-1] != '\n' {
-		return history{}, invalidVerification("missing_newline", 0, "", "every record must end with a newline")
+	if invalidEncoding {
+		return history{}, invalidVerification("invalid_encoding", 0, "", "ledger must be UTF-8 without BOM"), nil
 	}
-	lines := bytes.Split(data[:len(data)-1], []byte{'\n'})
-	v.RecordCount = len(lines)
-	for i, line := range lines {
-		if len(line) == 0 {
-			return history{}, invalidVerificationWithCount("blank_line", i+1, "", "blank records are not allowed", len(lines))
-		}
+	if missingNewline {
+		return history{}, invalidVerification("missing_newline", 0, "", "every record must end with a newline"), nil
 	}
-	if len(lines) == 0 {
-		return history{}, invalidVerification("missing_header", 1, "", "workspace header is required")
+	v.RecordCount = recordCount
+	if blankLine != 0 {
+		return history{}, invalidVerificationWithCount("blank_line", blankLine, "", "blank records are not allowed", recordCount), nil
+	}
+	if _, err := ledger.Seek(0, io.SeekStart); err != nil {
+		return history{}, Verification{}, err
+	}
+	reader := bufio.NewReader(ledger)
+	headerLine, err := readNativeRecord(reader)
+	if err != nil {
+		return history{}, Verification{}, err
 	}
 
-	headerFields, err := decodeOrderedObject(lines[0])
+	headerFields, err := decodeOrderedObject(headerLine)
 	if err != nil || !fieldNamesEqual(headerFields, []string{"record_type", "format_version", "workspace_id", "recorded_at", "prev_hash", "record_hash"}) {
-		return history{}, invalidVerificationWithCount("invalid_header", 1, "", "workspace header fields are invalid", len(lines))
+		return history{}, invalidVerificationWithCount("invalid_header", 1, "", "workspace header fields are invalid", recordCount), nil
 	}
 	var header workspaceHeader
-	if err := strictDecode(lines[0], &header); err != nil || header.RecordType != "workspace" || header.FormatVersion != FormatNative || header.WorkspaceID == "" || header.PrevHash != zeroHash || !nativeHash.MatchString(header.RecordHash) || !validUTCTimestamp(header.RecordedAt) {
-		return history{}, invalidVerificationWithCount("invalid_header", 1, header.WorkspaceID, "workspace header values are invalid", len(lines))
+	if err := strictDecode(headerLine, &header); err != nil || header.RecordType != "workspace" || header.FormatVersion != FormatNative || header.WorkspaceID == "" || header.PrevHash != zeroHash || !nativeHash.MatchString(header.RecordHash) || !validUTCTimestamp(header.RecordedAt) {
+		return history{}, invalidVerificationWithCount("invalid_header", 1, header.WorkspaceID, "workspace header values are invalid", recordCount), nil
 	}
 	expectedHeaderHash, _ := hashRecord(struct {
 		RecordType    string `json:"record_type"`
@@ -466,28 +530,31 @@ func parseNative(data []byte) (history, Verification) {
 		PrevHash      string `json:"prev_hash"`
 	}{header.RecordType, header.FormatVersion, header.WorkspaceID, header.RecordedAt, header.PrevHash})
 	if header.RecordHash != expectedHeaderHash {
-		return history{}, invalidVerificationWithCount("record_hash_mismatch", 1, header.WorkspaceID, "workspace header hash does not match", len(lines))
+		return history{}, invalidVerificationWithCount("record_hash_mismatch", 1, header.WorkspaceID, "workspace header hash does not match", recordCount), nil
 	}
 
-	h := history{header: header, facts: make([]Fact, 0, len(lines)-1)}
+	h := history{header: header, facts: make([]Fact, 0, recordCount-1)}
 	state := newNativeState(nil)
 	previousHash := header.RecordHash
 	lastID := header.WorkspaceID
-	for i := 1; i < len(lines); i++ {
-		number := i + 1
-		if err := jsonstrict.Validate(lines[i]); err != nil {
-			return history{}, invalidVerificationWithCount("invalid_fact_envelope", number, "", err.Error(), len(lines))
+	for number := 2; number <= recordCount; number++ {
+		line, err := readNativeRecord(reader)
+		if err != nil {
+			return history{}, Verification{}, err
 		}
-		fields, err := decodeOrderedObject(lines[i])
+		if err := jsonstrict.Validate(line); err != nil {
+			return history{}, invalidVerificationWithCount("invalid_fact_envelope", number, "", err.Error(), recordCount), nil
+		}
+		fields, err := decodeOrderedObject(line)
 		if err != nil || !fieldNamesEqual(fields, []string{"record_type", "fact_id", "task_id", "kind", "actor", "recorded_at", "payload", "prev_hash", "record_hash"}) {
-			return history{}, invalidVerificationWithCount("invalid_fact_envelope", number, "", "fact envelope fields are invalid", len(lines))
+			return history{}, invalidVerificationWithCount("invalid_fact_envelope", number, "", "fact envelope fields are invalid", recordCount), nil
 		}
 		var record factRecord
-		if err := strictDecode(lines[i], &record); err != nil || record.RecordType != "fact" || record.FactID == "" || record.TaskID == "" || record.Actor.Type == "" || record.Actor.ID == "" || !validUTCTimestamp(record.RecordedAt) || !nativeHash.MatchString(record.PrevHash) || !nativeHash.MatchString(record.RecordHash) {
-			return history{}, invalidVerificationWithCount("invalid_fact_envelope", number, record.FactID, "fact envelope values are invalid", len(lines))
+		if err := strictDecode(line, &record); err != nil || record.RecordType != "fact" || record.FactID == "" || record.TaskID == "" || record.Actor.Type == "" || record.Actor.ID == "" || !validUTCTimestamp(record.RecordedAt) || !nativeHash.MatchString(record.PrevHash) || !nativeHash.MatchString(record.RecordHash) {
+			return history{}, invalidVerificationWithCount("invalid_fact_envelope", number, record.FactID, "fact envelope values are invalid", recordCount), nil
 		}
 		if record.PrevHash != previousHash {
-			return history{}, invalidVerificationWithCount("previous_hash_mismatch", number, record.FactID, "previous hash does not match", len(lines))
+			return history{}, invalidVerificationWithCount("previous_hash_mismatch", number, record.FactID, "previous hash does not match", recordCount), nil
 		}
 		expectedHash, _ := hashRecord(struct {
 			RecordType string          `json:"record_type"`
@@ -500,11 +567,11 @@ func parseNative(data []byte) (history, Verification) {
 			PrevHash   string          `json:"prev_hash"`
 		}{record.RecordType, record.FactID, record.TaskID, record.Kind, record.Actor, record.RecordedAt, record.Payload, record.PrevHash})
 		if record.RecordHash != expectedHash {
-			return history{}, invalidVerificationWithCount("record_hash_mismatch", number, record.FactID, "fact hash does not match", len(lines))
+			return history{}, invalidVerificationWithCount("record_hash_mismatch", number, record.FactID, "fact hash does not match", recordCount), nil
 		}
 		code, err := state.validate(record.TaskID, record.Kind, record.Payload)
 		if err != nil {
-			return history{}, invalidVerificationWithCount(code, number, record.FactID, err.Error(), len(lines))
+			return history{}, invalidVerificationWithCount(code, number, record.FactID, err.Error(), recordCount), nil
 		}
 		h.facts = append(h.facts, record.fact())
 		state.add(h.facts[len(h.facts)-1])
@@ -514,7 +581,56 @@ func parseNative(data []byte) (history, Verification) {
 	v.StructuralValid = true
 	v.Integrity = IntegritySealedValid
 	v.LastRecordID = lastID
-	return h, v
+	return h, v, nil
+}
+
+func inspectNativeRecords(ledger io.ReadSeeker) (recordCount, blankLine int, invalidEncoding, missingNewline bool, err error) {
+	if _, err = ledger.Seek(0, io.SeekStart); err != nil {
+		return
+	}
+	reader := bufio.NewReader(ledger)
+	first := true
+	for {
+		line, readErr := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			hasNewline := line[len(line)-1] == '\n'
+			if hasNewline {
+				line = line[:len(line)-1]
+				recordCount++
+			} else {
+				missingNewline = true
+			}
+			if first && bytes.HasPrefix(line, []byte{0xef, 0xbb, 0xbf}) {
+				invalidEncoding = true
+			}
+			first = false
+			if !utf8.Valid(line) {
+				invalidEncoding = true
+			}
+			if hasNewline && len(line) == 0 && blankLine == 0 {
+				blankLine = recordCount
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			err = readErr
+			return
+		}
+	}
+	if recordCount == 0 {
+		missingNewline = true
+	}
+	return
+}
+
+func readNativeRecord(reader *bufio.Reader) ([]byte, error) {
+	line, err := reader.ReadBytes('\n')
+	if err != nil {
+		return nil, err
+	}
+	return line[:len(line)-1], nil
 }
 
 func validateSubmission(submission Submission, h history) error {
@@ -830,24 +946,135 @@ func validateContentRef(content ContentRef) error {
 }
 
 func (w *Workspace) appendRecord(line []byte) error {
-	ledger, err := os.OpenFile(filepath.Join(w.path, ".mcr", "events.jsonl"), os.O_WRONLY|os.O_APPEND, 0)
+	mcrDir := filepath.Join(w.path, ".mcr")
+	ledgerPath := filepath.Join(mcrDir, "events.jsonl")
+	ledger, info, err := openRegular(ledgerPath)
 	if err != nil {
-		return fmt.Errorf("open workspace ledger: %w", err)
+		return err
 	}
-	if _, err = ledger.Write(append(line, '\n')); err == nil {
-		err = ledger.Sync()
-	}
+	prior, err := io.ReadAll(ledger)
 	closeErr := ledger.Close()
 	if err == nil {
 		err = closeErr
 	}
 	if err != nil {
-		return fmt.Errorf("append workspace ledger: %w", err)
+		return fmt.Errorf("read workspace ledger for commit: %w", err)
+	}
+	temp, err := os.CreateTemp(mcrDir, ".events-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create workspace ledger temporary file: %w", err)
+	}
+	tempPath := temp.Name()
+	defer os.Remove(tempPath)
+	if err = temp.Chmod(info.Mode().Perm()); err == nil {
+		_, err = temp.Write(prior)
+	}
+	if err == nil {
+		_, err = temp.Write(line)
+	}
+	if err == nil {
+		_, err = temp.Write([]byte{'\n'})
+	}
+	if err == nil {
+		err = temp.Sync()
+	}
+	closeErr = temp.Close()
+	if err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return fmt.Errorf("write workspace ledger replacement: %w", err)
+	}
+	if err := beforeLedgerReplace(); err != nil {
+		return fmt.Errorf("replace workspace ledger: %w", err)
+	}
+	if err := os.Rename(tempPath, ledgerPath); err != nil {
+		return fmt.Errorf("replace workspace ledger: %w", err)
+	}
+	if err := syncDirectory(mcrDir); err != nil {
+		return fmt.Errorf("sync workspace storage: %w", err)
 	}
 	return nil
 }
 
-// ponytail: issue #15 owns inter-process locking and atomic replacement.
+func (w *Workspace) lock(exclusive bool) (*os.File, error) {
+	return lockDirectory(filepath.Join(w.path, ".mcr"), exclusive)
+}
+
+func lockDirectory(path string, exclusive bool) (*os.File, error) {
+	directory, err := openDirectory(path)
+	if err != nil {
+		return nil, fmt.Errorf("open workspace lock directory: %w", err)
+	}
+	operation := syscall.LOCK_SH | syscall.LOCK_NB
+	if exclusive {
+		operation = syscall.LOCK_EX | syscall.LOCK_NB
+	}
+	if err := syscall.Flock(int(directory.Fd()), operation); err != nil {
+		directory.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+			return nil, fmt.Errorf("%w: lock workspace storage: %w", ErrBusy, err)
+		}
+		return nil, fmt.Errorf("lock workspace storage: %w", err)
+	}
+	return directory, nil
+}
+
+func unlockDirectory(directory *os.File) {
+	_ = syscall.Flock(int(directory.Fd()), syscall.LOCK_UN)
+	_ = directory.Close()
+}
+
+func syncDirectory(path string) error {
+	directory, err := openDirectory(path)
+	if err != nil {
+		return err
+	}
+	err = directory.Sync()
+	closeErr := directory.Close()
+	if err == nil {
+		err = closeErr
+	}
+	return err
+}
+
+func openDirectory(path string) (*os.File, error) {
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		if errors.Is(err, syscall.ELOOP) || errors.Is(err, syscall.ENOTDIR) {
+			return nil, fmt.Errorf("%w: %s is not a real directory: %w", ErrConflict, path, err)
+		}
+		if errors.Is(err, syscall.ENOENT) {
+			return nil, fmt.Errorf("%w: %w", ErrNotFound, err)
+		}
+		return nil, err
+	}
+	return os.NewFile(uintptr(fd), path), nil
+}
+
+func openRegular(path string) (*os.File, os.FileInfo, error) {
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		if errors.Is(err, syscall.ELOOP) {
+			return nil, nil, fmt.Errorf("%w: %s is not a regular file: %w", ErrConflict, path, err)
+		}
+		if errors.Is(err, syscall.ENOENT) {
+			return nil, nil, fmt.Errorf("%w: %w", ErrNotFound, err)
+		}
+		return nil, nil, err
+	}
+	file := os.NewFile(uintptr(fd), path)
+	info, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, nil, err
+	}
+	if !info.Mode().IsRegular() {
+		file.Close()
+		return nil, nil, fmt.Errorf("%w: %s is not a regular file", ErrConflict, path)
+	}
+	return file, info, nil
+}
 
 func canonicalExistingDirectory(path string) (string, error) {
 	absolute, err := filepath.Abs(path)
