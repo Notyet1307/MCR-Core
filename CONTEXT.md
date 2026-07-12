@@ -73,7 +73,7 @@ A read-only view derived solely from one ordered MCR history, so the same valid 
 _Avoid_: mutable status store, workflow state machine, re-execution
 
 **Core Invariant**:
-A scenario-independent validity rule enforced by MCR Core: facts are immutable, internal fact references stay within one Workspace and Task, referenced internal facts exist, content hashes match, and decisions bind an exact subject and scope. External content references may cross that boundary only through stable identifiers and hashes; lifecycle gates, role separation, and scenario prerequisites are external policies rather than Core Invariants.
+A scenario-independent validity rule enforced by MCR Core: facts are immutable, internal fact references stay within one Workspace and Task, referenced internal facts exist, hash bindings on those references exactly match the recorded facts, and decisions bind an exact subject and scope. External content references may cross that boundary only through stable identifiers and hashes; Core governs those recorded bindings but does not infer that an external locator still resolves to the same bytes. Lifecycle gates, role separation, and scenario prerequisites are external policies rather than Core Invariants.
 _Avoid_: workflow rule, Pack rule, approval policy
 
 **Replay Compatibility**:
