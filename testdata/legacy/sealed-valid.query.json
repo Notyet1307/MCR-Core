@@ -1,0 +1,283 @@
+[
+  {
+    "fact_id": "task:alpha",
+    "task_id": "task/non-numeric",
+    "kind": "task.created",
+    "actor": {
+      "type": "human",
+      "id": "tester"
+    },
+    "recorded_at": "2025-01-02T03:04:05Z",
+    "payload": {
+      "task_id": "task/non-numeric",
+      "definition": {
+        "namespace": "example",
+        "id": "neutral-task",
+        "version": "1.0.0",
+        "locator": "defs/neutral.json",
+        "sha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "additive": "visible"
+    },
+    "prev_hash": "sha256:a248bf58a7d763bd2030429a5af3bd8f78bf97a9af700055804f153886abc255",
+    "record_hash": "sha256:13101626fd84de78fcdce7de0fd76bdddf8c6fa32bc9de1e0b2a6f37641eab70",
+    "opaque": false
+  },
+  {
+    "fact_id": "run.done#x",
+    "task_id": "task/non-numeric",
+    "kind": "run.recorded",
+    "actor": {
+      "type": "human",
+      "id": "tester"
+    },
+    "recorded_at": "2025-01-02T03:04:05Z",
+    "payload": {
+      "task_id": "task/non-numeric",
+      "started_at": "2025-01-02T03:00:00Z",
+      "ended_at": "2025-01-02T03:01:00Z",
+      "outcome": "completed",
+      "additive_run": "visible"
+    },
+    "prev_hash": "sha256:13101626fd84de78fcdce7de0fd76bdddf8c6fa32bc9de1e0b2a6f37641eab70",
+    "record_hash": "sha256:9b30e369edf6cc81bc59a70a2f12d02db644426c4499c74561aed20493bd8837",
+    "opaque": false
+  },
+  {
+    "fact_id": "review?under",
+    "task_id": "task/non-numeric",
+    "kind": "opaque.recorded",
+    "actor": {
+      "type": "human",
+      "id": "tester"
+    },
+    "recorded_at": "2025-01-02T03:04:05Z",
+    "payload": {
+      "task_id": "task/non-numeric",
+      "verdict": "accept",
+      "findings": "under-bound",
+      "additive_review": true
+    },
+    "prev_hash": "sha256:9b30e369edf6cc81bc59a70a2f12d02db644426c4499c74561aed20493bd8837",
+    "record_hash": "sha256:123f540557140873640f14ee27b55dba708684afd68cdc313b4715648a0adf76",
+    "opaque": true,
+    "opaque_reason": "legacy_underbound"
+  },
+  {
+    "fact_id": "approval?under",
+    "task_id": "task/non-numeric",
+    "kind": "opaque.recorded",
+    "actor": {
+      "type": "human",
+      "id": "tester"
+    },
+    "recorded_at": "2025-01-02T03:04:05Z",
+    "payload": {
+      "task_id": "task/non-numeric",
+      "scope": "task",
+      "decision": "approved",
+      "additive_approval": true
+    },
+    "prev_hash": "sha256:123f540557140873640f14ee27b55dba708684afd68cdc313b4715648a0adf76",
+    "record_hash": "sha256:611e42b15aac3340c05f4e6f774a1d0667e007e28f35ce1b06d0c822d37b2ea8",
+    "opaque": true,
+    "opaque_reason": "legacy_underbound"
+  },
+  {
+    "fact_id": "policy?under",
+    "task_id": "task/non-numeric",
+    "kind": "opaque.recorded",
+    "actor": {
+      "type": "human",
+      "id": "tester"
+    },
+    "recorded_at": "2025-01-02T03:04:05Z",
+    "payload": {
+      "task_id": "task/non-numeric",
+      "action": "deliver",
+      "policy": "neutral",
+      "result": "allow",
+      "additive_policy": true
+    },
+    "prev_hash": "sha256:611e42b15aac3340c05f4e6f774a1d0667e007e28f35ce1b06d0c822d37b2ea8",
+    "record_hash": "sha256:c6bf8dc9ab1d3da29754d31389b3658216239924ed824bb41a0f99705d29aa33",
+    "opaque": true,
+    "opaque_reason": "legacy_underbound"
+  },
+  {
+    "fact_id": "delivery?under",
+    "task_id": "task/non-numeric",
+    "kind": "opaque.recorded",
+    "actor": {
+      "type": "human",
+      "id": "tester"
+    },
+    "recorded_at": "2025-01-02T03:04:05Z",
+    "payload": {
+      "task_id": "task/non-numeric",
+      "path": "out/report.txt",
+      "format": "text",
+      "additive_delivery": true
+    },
+    "prev_hash": "sha256:c6bf8dc9ab1d3da29754d31389b3658216239924ed824bb41a0f99705d29aa33",
+    "record_hash": "sha256:f29a6002195d7c6cbff0ba7a6c4b6461f5d517d7109969c75fba52a82f223141",
+    "opaque": true,
+    "opaque_reason": "legacy_underbound"
+  },
+  {
+    "fact_id": "evidence@joined",
+    "task_id": "task/non-numeric",
+    "kind": "opaque.recorded",
+    "actor": {
+      "type": "human",
+      "id": "tester"
+    },
+    "recorded_at": "2025-01-02T03:04:05Z",
+    "payload": {
+      "task_id": "task/non-numeric",
+      "claim": {
+        "id": "claim-business"
+      },
+      "source": {
+        "hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+      },
+      "additive_evidence": true
+    },
+    "prev_hash": "sha256:f29a6002195d7c6cbff0ba7a6c4b6461f5d517d7109969c75fba52a82f223141",
+    "record_hash": "sha256:f801ae3cbbebe94f539400c9f774adf5edf7608966fc365c552b0bc2be41460c",
+    "opaque": true,
+    "opaque_reason": "legacy_underbound"
+  },
+  {
+    "fact_id": "session@herdr",
+    "task_id": "task/non-numeric",
+    "kind": "opaque.recorded",
+    "actor": {
+      "type": "human",
+      "id": "tester"
+    },
+    "recorded_at": "2025-01-02T03:04:05Z",
+    "payload": {
+      "task_id": "task/non-numeric",
+      "session": "opaque",
+      "additive_session": true
+    },
+    "prev_hash": "sha256:f801ae3cbbebe94f539400c9f774adf5edf7608966fc365c552b0bc2be41460c",
+    "record_hash": "sha256:492cef8992ec0f6d45fc07df1ea43ca83368b5ad7b474b17adaa0cbea6906bfd",
+    "opaque": true,
+    "opaque_reason": "legacy_extension"
+  },
+  {
+    "fact_id": "log@captured",
+    "task_id": "task/non-numeric",
+    "kind": "opaque.recorded",
+    "actor": {
+      "type": "human",
+      "id": "tester"
+    },
+    "recorded_at": "2025-01-02T03:04:05Z",
+    "payload": {
+      "task_id": "task/non-numeric",
+      "log": "opaque",
+      "additive_log": true
+    },
+    "prev_hash": "sha256:492cef8992ec0f6d45fc07df1ea43ca83368b5ad7b474b17adaa0cbea6906bfd",
+    "record_hash": "sha256:7b657023324fdba89e9e053dcaab7fbac6d3be124742d064598b830dc001841b",
+    "opaque": true,
+    "opaque_reason": "legacy_extension"
+  },
+  {
+    "fact_id": "capability@grant",
+    "task_id": "task/non-numeric",
+    "kind": "opaque.recorded",
+    "actor": {
+      "type": "human",
+      "id": "tester"
+    },
+    "recorded_at": "2025-01-02T03:04:05Z",
+    "payload": {
+      "task_id": "task/non-numeric",
+      "capability": "opaque",
+      "additive_capability": true
+    },
+    "prev_hash": "sha256:7b657023324fdba89e9e053dcaab7fbac6d3be124742d064598b830dc001841b",
+    "record_hash": "sha256:9dae82fc2b35addda6fed8b4070c813cbc5eb536a3a81c7f7affa13e8a1f9aad",
+    "opaque": true,
+    "opaque_reason": "legacy_extension"
+  },
+  {
+    "fact_id": "tool.call@record",
+    "task_id": "task/non-numeric",
+    "kind": "opaque.recorded",
+    "actor": {
+      "type": "human",
+      "id": "tester"
+    },
+    "recorded_at": "2025-01-02T03:04:05Z",
+    "payload": {
+      "task_id": "task/non-numeric",
+      "tool": "opaque",
+      "additive_tool": true
+    },
+    "prev_hash": "sha256:9dae82fc2b35addda6fed8b4070c813cbc5eb536a3a81c7f7affa13e8a1f9aad",
+    "record_hash": "sha256:02184dd87cb8bf89f5e775fe0c3877efc42fe70594e8e43a8b8293ead4783c64",
+    "opaque": true,
+    "opaque_reason": "legacy_extension"
+  },
+  {
+    "fact_id": "customer.report@pub",
+    "task_id": "task/non-numeric",
+    "kind": "opaque.recorded",
+    "actor": {
+      "type": "human",
+      "id": "tester"
+    },
+    "recorded_at": "2025-01-02T03:04:05Z",
+    "payload": {
+      "task_id": "task/non-numeric",
+      "report": "opaque",
+      "additive_customer": true
+    },
+    "prev_hash": "sha256:02184dd87cb8bf89f5e775fe0c3877efc42fe70594e8e43a8b8293ead4783c64",
+    "record_hash": "sha256:d68c610610a0447ca25c216e58916bf7d34078cba0e9e57ddf1ac154bd5fc961",
+    "opaque": true,
+    "opaque_reason": "legacy_extension"
+  },
+  {
+    "fact_id": "scenario:event",
+    "task_id": "task/non-numeric",
+    "kind": "opaque.recorded",
+    "actor": {
+      "type": "human",
+      "id": "tester"
+    },
+    "recorded_at": "2025-01-02T03:04:05Z",
+    "payload": {
+      "task_id": "task/non-numeric",
+      "scenario": "opaque",
+      "additive_scenario": true
+    },
+    "prev_hash": "sha256:d68c610610a0447ca25c216e58916bf7d34078cba0e9e57ddf1ac154bd5fc961",
+    "record_hash": "sha256:d3aad97f9f5569afbf922886aadf607099c25d70c009062fd5fba710ffd1fc22",
+    "opaque": true,
+    "opaque_reason": "legacy_extension"
+  },
+  {
+    "fact_id": "unknown+extension",
+    "task_id": "",
+    "kind": "opaque.recorded",
+    "actor": {
+      "type": "human",
+      "id": "tester"
+    },
+    "recorded_at": "2025-01-02T03:04:05Z",
+    "payload": {
+      "note": "workspace scoped",
+      "additive_unknown": true
+    },
+    "prev_hash": "sha256:d3aad97f9f5569afbf922886aadf607099c25d70c009062fd5fba710ffd1fc22",
+    "record_hash": "sha256:002eb700bce4815949b05f08fcbd963a7700dd3e98ac5954fe38a2c9d1ffe00a",
+    "opaque": true,
+    "opaque_reason": "legacy_extension"
+  }
+]

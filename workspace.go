@@ -49,8 +49,13 @@ type factRecord struct {
 }
 
 type history struct {
-	header workspaceHeader
-	facts  []Fact
+	header           workspaceHeader
+	facts            []Fact
+	format           string
+	readOnly         bool
+	semanticPayloads []json.RawMessage
+	semanticTaskIDs  []string
+	rawLines         [][]byte
 }
 
 type runPayload struct {
@@ -136,7 +141,7 @@ func (s *nativeState) validate(taskID, kind string, payload json.RawMessage) (st
 		return "unknown_kind", errors.New("native fact kind is not supported")
 	}
 	taskExists := s.tasks[taskID]
-	if kind != KindTaskCreated && !taskExists {
+	if kind != KindTaskCreated && !taskExists && !(kind == KindOpaqueRecorded && taskID == "") {
 		return "invalid_payload", errors.New("task does not exist")
 	}
 	var err error
@@ -320,6 +325,9 @@ func (w *Workspace) Submit(submission Submission) (Fact, error) {
 	if !verification.StructuralValid || verification.Integrity != IntegritySealedValid {
 		return zero, fmt.Errorf("%w: workspace ledger is not valid", ErrInvalidHistory)
 	}
+	if h.readOnly {
+		return zero, fmt.Errorf("%w: sealed legacy workspace", ErrReadOnly)
+	}
 	if err := validateSubmission(submission, h); err != nil {
 		return zero, err
 	}
@@ -399,12 +407,20 @@ func (w *Workspace) Replay() (Projection, error) {
 	if !verification.StructuralValid || verification.Integrity != IntegritySealedValid {
 		return Projection{}, fmt.Errorf("%w: workspace ledger is not valid", ErrInvalidHistory)
 	}
-	projection := Projection{WorkspaceID: h.header.WorkspaceID, Format: "native", Integrity: IntegritySealedValid, Tasks: make([]TaskProjection, 0, len(h.facts))}
+	return projectHistory(h, verification.Format), nil
+}
+
+func projectHistory(h history, format string) Projection {
+	projection := Projection{WorkspaceID: h.header.WorkspaceID, Format: format, Integrity: IntegritySealedValid, Tasks: make([]TaskProjection, 0, len(h.facts)), OpaqueFacts: []OpaqueFactProjection{}}
 	taskIndexes := make(map[string]int)
-	for _, fact := range h.facts {
+	for index, fact := range h.facts {
+		payload := fact.Payload
+		if index < len(h.semanticPayloads) && len(h.semanticPayloads[index]) != 0 {
+			payload = h.semanticPayloads[index]
+		}
 		switch fact.Kind {
 		case KindTaskCreated:
-			definition, _ := decodeTaskPayload(fact.Payload)
+			definition, _ := decodeTaskPayload(payload)
 			taskIndexes[fact.TaskID] = len(projection.Tasks)
 			projection.Tasks = append(projection.Tasks, TaskProjection{
 				TaskID: fact.TaskID, SourceFactID: fact.FactID, Definition: definition,
@@ -414,54 +430,56 @@ func (w *Workspace) Replay() (Projection, error) {
 				Deliveries: []DeliveryProjection{}, OpaqueFacts: []OpaqueFactProjection{},
 			})
 		case KindRunRecorded:
-			payload, _ := decodeRunPayload(fact.Payload)
+			decoded, _ := decodeRunPayload(payload)
 			task := &projection.Tasks[taskIndexes[fact.TaskID]]
-			task.Runs = append(task.Runs, RunProjection{
-				SourceFactID: fact.FactID, StartedAt: payload.StartedAt, EndedAt: payload.EndedAt, Outcome: payload.Outcome,
-			})
+			task.Runs = append(task.Runs, RunProjection{SourceFactID: fact.FactID, StartedAt: decoded.StartedAt, EndedAt: decoded.EndedAt, Outcome: decoded.Outcome})
 		case KindInputRegistered:
-			content, _ := decodeInputPayload(fact.Payload)
+			content, _ := decodeInputPayload(payload)
 			task := &projection.Tasks[taskIndexes[fact.TaskID]]
 			task.RegisteredInputs = append(task.RegisteredInputs, RegisteredInputProjection{SourceFactID: fact.FactID, Content: content})
 		case KindArtifactRecorded:
-			payload, _ := decodeArtifactPayload(fact.Payload)
+			decoded, _ := decodeArtifactPayload(payload)
 			task := &projection.Tasks[taskIndexes[fact.TaskID]]
-			task.Artifacts = append(task.Artifacts, ArtifactProjection{SourceFactID: fact.FactID, Content: payload.Content, Run: payload.Run})
+			task.Artifacts = append(task.Artifacts, ArtifactProjection{SourceFactID: fact.FactID, Content: decoded.Content, Run: decoded.Run})
 		case KindClaimRecorded:
-			payload, _ := decodeClaimPayload(fact.Payload)
+			decoded, _ := decodeClaimPayload(payload)
 			task := &projection.Tasks[taskIndexes[fact.TaskID]]
-			task.Claims = append(task.Claims, ClaimProjection{SourceFactID: fact.FactID, Statement: payload.Statement, OriginArtifact: payload.OriginArtifact})
+			task.Claims = append(task.Claims, ClaimProjection{SourceFactID: fact.FactID, Statement: decoded.Statement, OriginArtifact: decoded.OriginArtifact})
 		case KindSourceReferenceRecorded:
-			payload, _ := decodeSourceReferencePayload(fact.Payload)
+			decoded, _ := decodeSourceReferencePayload(payload)
 			task := &projection.Tasks[taskIndexes[fact.TaskID]]
-			task.SourceReferences = append(task.SourceReferences, SourceReferenceProjection{SourceFactID: fact.FactID, Content: payload.Content, Anchor: payload.Anchor})
+			task.SourceReferences = append(task.SourceReferences, SourceReferenceProjection{SourceFactID: fact.FactID, Content: decoded.Content, Anchor: decoded.Anchor})
 		case KindEvidenceLinked:
-			payload, _ := decodeEvidenceLinkPayload(fact.Payload)
+			decoded, _ := decodeEvidenceLinkPayload(payload)
 			task := &projection.Tasks[taskIndexes[fact.TaskID]]
-			task.EvidenceLinks = append(task.EvidenceLinks, EvidenceLinkProjection{SourceFactID: fact.FactID, Claim: payload.Claim, Source: payload.Source})
+			task.EvidenceLinks = append(task.EvidenceLinks, EvidenceLinkProjection{SourceFactID: fact.FactID, Claim: decoded.Claim, Source: decoded.Source})
 		case KindReviewRecorded:
-			payload, _ := decodeReviewPayload(fact.Payload)
+			decoded, _ := decodeReviewPayload(payload)
 			task := &projection.Tasks[taskIndexes[fact.TaskID]]
-			task.Reviews = append(task.Reviews, ReviewProjection{SourceFactID: fact.FactID, Subject: payload.Subject, Outcome: payload.Outcome, Findings: payload.Findings})
+			task.Reviews = append(task.Reviews, ReviewProjection{SourceFactID: fact.FactID, Subject: decoded.Subject, Outcome: decoded.Outcome, Findings: decoded.Findings})
 		case KindApprovalRecorded:
-			payload, _ := decodeApprovalPayload(fact.Payload)
+			decoded, _ := decodeApprovalPayload(payload)
 			task := &projection.Tasks[taskIndexes[fact.TaskID]]
-			task.Approvals = append(task.Approvals, ApprovalProjection{SourceFactID: fact.FactID, Subject: payload.Subject, Scope: payload.Scope, Decision: payload.Decision, Note: payload.Note})
+			task.Approvals = append(task.Approvals, ApprovalProjection{SourceFactID: fact.FactID, Subject: decoded.Subject, Scope: decoded.Scope, Decision: decoded.Decision, Note: decoded.Note})
 		case KindPolicyDecisionRecorded:
-			payload, _ := decodePolicyDecisionPayload(fact.Payload)
+			decoded, _ := decodePolicyDecisionPayload(payload)
 			task := &projection.Tasks[taskIndexes[fact.TaskID]]
-			task.PolicyDecisions = append(task.PolicyDecisions, PolicyDecisionProjection{SourceFactID: fact.FactID, Subject: payload.Subject, Action: payload.Action, Policy: payload.Policy, Result: payload.Result})
+			task.PolicyDecisions = append(task.PolicyDecisions, PolicyDecisionProjection{SourceFactID: fact.FactID, Subject: decoded.Subject, Action: decoded.Action, Policy: decoded.Policy, Result: decoded.Result})
 		case KindDeliveryRecorded:
-			payload, _ := decodeDeliveryPayload(fact.Payload)
+			decoded, _ := decodeDeliveryPayload(payload)
 			task := &projection.Tasks[taskIndexes[fact.TaskID]]
-			task.Deliveries = append(task.Deliveries, DeliveryProjection{SourceFactID: fact.FactID, Artifacts: payload.Artifacts, Format: payload.Format, Scope: payload.Scope, Target: payload.Target})
+			task.Deliveries = append(task.Deliveries, DeliveryProjection{SourceFactID: fact.FactID, Artifacts: decoded.Artifacts, Format: decoded.Format, Scope: decoded.Scope, Target: decoded.Target})
 		case KindOpaqueRecorded:
-			payload, _ := decodeOpaquePayload(fact.Payload)
-			task := &projection.Tasks[taskIndexes[fact.TaskID]]
-			task.OpaqueFacts = append(task.OpaqueFacts, OpaqueFactProjection{SourceFactID: fact.FactID, Kind: payload.Kind, Data: payload.Data})
+			decoded, _ := decodeOpaquePayload(payload)
+			opaque := OpaqueFactProjection{SourceFactID: fact.FactID, Kind: decoded.Kind, Data: decoded.Data}
+			if taskIndex, found := taskIndexes[fact.TaskID]; found {
+				projection.Tasks[taskIndex].OpaqueFacts = append(projection.Tasks[taskIndex].OpaqueFacts, opaque)
+			} else {
+				projection.OpaqueFacts = append(projection.OpaqueFacts, opaque)
+			}
 		}
 	}
-	return projection, nil
+	return projection
 }
 
 func (w *Workspace) Verify() (Verification, error) {
@@ -482,7 +500,17 @@ func (w *Workspace) readHistory() (history, Verification, error) {
 		return history{}, Verification{}, err
 	}
 	defer ledger.Close()
-	h, verification, err := parseNative(ledger)
+	format, err := detectHistoryFormat(ledger)
+	if err != nil {
+		return history{}, Verification{}, fmt.Errorf("read workspace ledger: %w", err)
+	}
+	var h history
+	var verification Verification
+	if format == "legacy" {
+		h, verification, err = parseLegacy(ledger)
+	} else {
+		h, verification, err = parseNative(ledger)
+	}
 	if err != nil {
 		return history{}, Verification{}, fmt.Errorf("read workspace ledger: %w", err)
 	}

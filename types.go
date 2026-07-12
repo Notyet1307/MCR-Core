@@ -86,10 +86,11 @@ type FactQuery struct {
 }
 
 type Projection struct {
-	WorkspaceID string           `json:"workspace_id"`
-	Format      string           `json:"format"`
-	Integrity   string           `json:"integrity"`
-	Tasks       []TaskProjection `json:"tasks"`
+	WorkspaceID string                 `json:"workspace_id"`
+	Format      string                 `json:"format"`
+	Integrity   string                 `json:"integrity"`
+	Tasks       []TaskProjection       `json:"tasks"`
+	OpaqueFacts []OpaqueFactProjection `json:"opaque_facts"`
 }
 
 type TaskProjection struct {

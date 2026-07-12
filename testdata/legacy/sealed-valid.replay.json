@@ -1,0 +1,156 @@
+{
+  "workspace_id": "workspace/opaque",
+  "format": "legacy",
+  "integrity": "sealed_valid",
+  "tasks": [
+    {
+      "task_id": "task/non-numeric",
+      "source_fact_id": "task:alpha",
+      "definition": {
+        "namespace": "example",
+        "id": "neutral-task",
+        "version": "1.0.0",
+        "locator": "defs/neutral.json",
+        "sha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "runs": [
+        {
+          "source_fact_id": "run.done#x",
+          "started_at": "2025-01-02T03:00:00Z",
+          "ended_at": "2025-01-02T03:01:00Z",
+          "outcome": "completed"
+        }
+      ],
+      "registered_inputs": [],
+      "artifacts": [],
+      "claims": [],
+      "source_references": [],
+      "evidence_links": [],
+      "reviews": [],
+      "approvals": [],
+      "policy_decisions": [],
+      "deliveries": [],
+      "opaque_facts": [
+        {
+          "source_fact_id": "review?under",
+          "kind": "ReviewSubmitted",
+          "data": {
+            "task_id": "task/non-numeric",
+            "verdict": "accept",
+            "findings": "under-bound",
+            "additive_review": true
+          }
+        },
+        {
+          "source_fact_id": "approval?under",
+          "kind": "ApprovalGranted",
+          "data": {
+            "task_id": "task/non-numeric",
+            "scope": "task",
+            "decision": "approved",
+            "additive_approval": true
+          }
+        },
+        {
+          "source_fact_id": "policy?under",
+          "kind": "PolicyDecisionRecorded",
+          "data": {
+            "task_id": "task/non-numeric",
+            "action": "deliver",
+            "policy": "neutral",
+            "result": "allow",
+            "additive_policy": true
+          }
+        },
+        {
+          "source_fact_id": "delivery?under",
+          "kind": "DeliveryRecorded",
+          "data": {
+            "task_id": "task/non-numeric",
+            "path": "out/report.txt",
+            "format": "text",
+            "additive_delivery": true
+          }
+        },
+        {
+          "source_fact_id": "evidence@joined",
+          "kind": "EvidenceLinked",
+          "data": {
+            "task_id": "task/non-numeric",
+            "claim": {
+              "id": "claim-business"
+            },
+            "source": {
+              "hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+            },
+            "additive_evidence": true
+          }
+        },
+        {
+          "source_fact_id": "session@herdr",
+          "kind": "HerdrSessionPrepared",
+          "data": {
+            "task_id": "task/non-numeric",
+            "session": "opaque",
+            "additive_session": true
+          }
+        },
+        {
+          "source_fact_id": "log@captured",
+          "kind": "RunLogCaptured",
+          "data": {
+            "task_id": "task/non-numeric",
+            "log": "opaque",
+            "additive_log": true
+          }
+        },
+        {
+          "source_fact_id": "capability@grant",
+          "kind": "CapabilityGranted",
+          "data": {
+            "task_id": "task/non-numeric",
+            "capability": "opaque",
+            "additive_capability": true
+          }
+        },
+        {
+          "source_fact_id": "tool.call@record",
+          "kind": "ToolCallRecorded",
+          "data": {
+            "task_id": "task/non-numeric",
+            "tool": "opaque",
+            "additive_tool": true
+          }
+        },
+        {
+          "source_fact_id": "customer.report@pub",
+          "kind": "CustomerReportPublished",
+          "data": {
+            "task_id": "task/non-numeric",
+            "report": "opaque",
+            "additive_customer": true
+          }
+        },
+        {
+          "source_fact_id": "scenario:event",
+          "kind": "ExposureCalculated",
+          "data": {
+            "task_id": "task/non-numeric",
+            "scenario": "opaque",
+            "additive_scenario": true
+          }
+        }
+      ]
+    }
+  ],
+  "opaque_facts": [
+    {
+      "source_fact_id": "unknown+extension",
+      "kind": "BrandNewLegacyEvent",
+      "data": {
+        "note": "workspace scoped",
+        "additive_unknown": true
+      }
+    }
+  ]
+}
