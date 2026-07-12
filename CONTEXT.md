@@ -16,6 +16,10 @@ _Avoid_: tenant, customer, project, case, directory
 The immutable governance subject identified within one Workspace and introduced with its initial contract. Later changes are additional Task Facts; MCR Core defines no universal lifecycle or status enum, and any current status is an adapter projection.
 _Avoid_: mutable task row, workflow job, agent process
 
+**Definition Reference**:
+The immutable binding from a Task to exactly one external Pack or scenario definition. It records the definition's namespace, stable external identity, version label, locator, and SHA-256 digest; a different definition requires a different Task. MCR Core governs the recorded binding but does not resolve the locator, re-hash external content, or interpret the definition.
+_Avoid_: Pack content, mutable Pack pointer, scenario configuration, Core-owned manifest
+
 **Actor**:
 The opaque attribution on a Task Fact identifying the human or integration that submitted it. An Actor is not proof of identity, authentication, authorization, or role membership; those remain adapter responsibilities.
 _Avoid_: user account, authenticated principal, RBAC role
