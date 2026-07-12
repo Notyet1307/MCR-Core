@@ -7,12 +7,15 @@ import (
 )
 
 const (
-	KindTaskCreated      = "task.created"
-	KindRunRecorded      = "run.recorded"
-	KindInputRegistered  = "input.registered"
-	KindArtifactRecorded = "artifact.recorded"
-	IntegritySealedValid = "sealed_valid"
-	FormatNative         = "mcr-core/v1"
+	KindTaskCreated             = "task.created"
+	KindRunRecorded             = "run.recorded"
+	KindInputRegistered         = "input.registered"
+	KindArtifactRecorded        = "artifact.recorded"
+	KindClaimRecorded           = "claim.recorded"
+	KindSourceReferenceRecorded = "source_reference.recorded"
+	KindEvidenceLinked          = "evidence.linked"
+	IntegritySealedValid        = "sealed_valid"
+	FormatNative                = "mcr-core/v1"
 )
 
 var (
@@ -91,6 +94,9 @@ type TaskProjection struct {
 	Runs             []RunProjection             `json:"runs"`
 	RegisteredInputs []RegisteredInputProjection `json:"registered_inputs"`
 	Artifacts        []ArtifactProjection        `json:"artifacts"`
+	Claims           []ClaimProjection           `json:"claims"`
+	SourceReferences []SourceReferenceProjection `json:"source_references"`
+	EvidenceLinks    []EvidenceLinkProjection    `json:"evidence_links"`
 }
 
 type RunProjection struct {
@@ -109,6 +115,24 @@ type ArtifactProjection struct {
 	SourceFactID string     `json:"source_fact_id"`
 	Content      ContentRef `json:"content"`
 	Run          *FactRef   `json:"run,omitempty"`
+}
+
+type ClaimProjection struct {
+	SourceFactID   string   `json:"source_fact_id"`
+	Statement      string   `json:"statement"`
+	OriginArtifact *FactRef `json:"origin_artifact,omitempty"`
+}
+
+type SourceReferenceProjection struct {
+	SourceFactID string     `json:"source_fact_id"`
+	Content      ContentRef `json:"content"`
+	Anchor       string     `json:"anchor"`
+}
+
+type EvidenceLinkProjection struct {
+	SourceFactID string  `json:"source_fact_id"`
+	Claim        FactRef `json:"claim"`
+	Source       FactRef `json:"source"`
 }
 
 type Diagnostic struct {

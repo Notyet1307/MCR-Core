@@ -145,6 +145,244 @@ func TestRegisteredInputsAndArtifactsRoundTrip(t *testing.T) {
 	}
 }
 
+func TestClaimsSourcesAndEvidenceRoundTrip(t *testing.T) {
+	workspace, err := mcr.Create(t.TempDir(), "workspace-evidence")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := workspace.Submit(validTaskSubmission("task-1")); err != nil {
+		t.Fatalf("Submit task: %v", err)
+	}
+	content := mcr.ContentRef{Locator: "urn:example:artifact", SHA256: digest}
+	artifact, err := workspace.Submit(submission("task-1", mcr.KindArtifactRecorded, map[string]any{"content": content}))
+	if err != nil {
+		t.Fatalf("Submit Artifact: %v", err)
+	}
+	claimWithoutOrigin, err := workspace.Submit(submission("task-1", mcr.KindClaimRecorded, map[string]any{"statement": "The first exact statement."}))
+	if err != nil {
+		t.Fatalf("Submit Claim without origin: %v", err)
+	}
+	origin := mcr.FactRef{FactID: artifact.FactID, RecordHash: artifact.RecordHash}
+	claimWithOrigin, err := workspace.Submit(submission("task-1", mcr.KindClaimRecorded, map[string]any{
+		"statement": "The second exact statement.", "origin_artifact": origin,
+	}))
+	if err != nil {
+		t.Fatalf("Submit Claim with origin: %v", err)
+	}
+	sourceContent := mcr.ContentRef{Locator: "urn:example:source", SHA256: digest}
+	source, err := workspace.Submit(submission("task-1", mcr.KindSourceReferenceRecorded, map[string]any{
+		"content": sourceContent, "anchor": "section-2",
+	}))
+	if err != nil {
+		t.Fatalf("Submit Source Reference: %v", err)
+	}
+	evidence, err := workspace.Submit(submission("task-1", mcr.KindEvidenceLinked, map[string]any{
+		"claim":  mcr.FactRef{FactID: claimWithOrigin.FactID, RecordHash: claimWithOrigin.RecordHash},
+		"source": mcr.FactRef{FactID: source.FactID, RecordHash: source.RecordHash},
+	}))
+	if err != nil {
+		t.Fatalf("Submit Evidence Link: %v", err)
+	}
+
+	facts, err := workspace.Query(mcr.FactQuery{TaskID: "task-1"})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	wantIDs := []string{artifact.FactID, claimWithoutOrigin.FactID, claimWithOrigin.FactID, source.FactID, evidence.FactID}
+	for i, want := range wantIDs {
+		if facts[i+1].FactID != want {
+			t.Fatalf("Query order = %+v", facts)
+		}
+	}
+	for _, filtered := range []struct {
+		kind string
+		ids  []string
+	}{
+		{mcr.KindClaimRecorded, []string{claimWithoutOrigin.FactID, claimWithOrigin.FactID}},
+		{mcr.KindSourceReferenceRecorded, []string{source.FactID}},
+		{mcr.KindEvidenceLinked, []string{evidence.FactID}},
+	} {
+		got, err := workspace.Query(mcr.FactQuery{TaskID: "task-1", Kind: filtered.kind})
+		if err != nil || len(got) != len(filtered.ids) {
+			t.Fatalf("Query %s = %+v, %v", filtered.kind, got, err)
+		}
+		for i, fact := range got {
+			if fact.FactID != filtered.ids[i] {
+				t.Fatalf("Query %s order = %+v", filtered.kind, got)
+			}
+		}
+	}
+
+	projection, err := workspace.Replay()
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	task := projection.Tasks[0]
+	if len(task.Claims) != 2 || task.Claims[0].SourceFactID != claimWithoutOrigin.FactID || task.Claims[0].Statement != "The first exact statement." || task.Claims[0].OriginArtifact != nil {
+		t.Fatalf("Claims = %+v", task.Claims)
+	}
+	if task.Claims[1].SourceFactID != claimWithOrigin.FactID || task.Claims[1].OriginArtifact == nil || *task.Claims[1].OriginArtifact != origin {
+		t.Fatalf("Claim origin = %+v", task.Claims[1])
+	}
+	if len(task.SourceReferences) != 1 || task.SourceReferences[0].SourceFactID != source.FactID || task.SourceReferences[0].Content != sourceContent || task.SourceReferences[0].Anchor != "section-2" {
+		t.Fatalf("Source References = %+v", task.SourceReferences)
+	}
+	wantClaim := mcr.FactRef{FactID: claimWithOrigin.FactID, RecordHash: claimWithOrigin.RecordHash}
+	wantSource := mcr.FactRef{FactID: source.FactID, RecordHash: source.RecordHash}
+	if len(task.EvidenceLinks) != 1 || task.EvidenceLinks[0].SourceFactID != evidence.FactID || task.EvidenceLinks[0].Claim != wantClaim || task.EvidenceLinks[0].Source != wantSource {
+		t.Fatalf("Evidence Links = %+v", task.EvidenceLinks)
+	}
+	replayedAgain, err := workspace.Replay()
+	if err != nil {
+		t.Fatalf("Replay again: %v", err)
+	}
+	firstJSON, err := json.Marshal(projection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondJSON, err := json.Marshal(replayedAgain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(firstJSON, secondJSON) {
+		t.Fatalf("Replay changed: %s != %s", firstJSON, secondJSON)
+	}
+}
+
+func TestClaimSourceEvidenceRejectionsLeaveLedgerUnchanged(t *testing.T) {
+	content := mcr.ContentRef{Locator: "urn:example:content", SHA256: digest}
+	otherDigest := "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+	tests := []struct {
+		name string
+		make func(artifact, claim, source, otherArtifact, otherClaim, otherSource mcr.Fact) mcr.Submission
+	}{
+		{"Claim empty statement", func(_, _, _, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindClaimRecorded, map[string]any{"statement": ""})
+		}},
+		{"Claim unknown field", func(_, _, _, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindClaimRecorded, map[string]any{"statement": "exact", "truth": true})
+		}},
+		{"Claim null origin", func(_, _, _, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindClaimRecorded, map[string]any{"statement": "exact", "origin_artifact": nil})
+		}},
+		{"Claim malformed origin", func(_, _, _, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindClaimRecorded, map[string]any{"statement": "exact", "origin_artifact": map[string]any{"fact_id": "fact", "record_hash": digest, "extra": true}})
+		}},
+		{"Claim missing or forward origin", func(_, _, _, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindClaimRecorded, map[string]any{"statement": "exact", "origin_artifact": mcr.FactRef{FactID: "fact_missing", RecordHash: otherDigest}})
+		}},
+		{"Claim cross Task origin", func(_, _, _, otherArtifact, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindClaimRecorded, map[string]any{"statement": "exact", "origin_artifact": mcr.FactRef{FactID: otherArtifact.FactID, RecordHash: otherArtifact.RecordHash}})
+		}},
+		{"Claim wrong Kind origin", func(_, _, source, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindClaimRecorded, map[string]any{"statement": "exact", "origin_artifact": mcr.FactRef{FactID: source.FactID, RecordHash: source.RecordHash}})
+		}},
+		{"Claim origin hash mismatch", func(artifact, _, _, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindClaimRecorded, map[string]any{"statement": "exact", "origin_artifact": mcr.FactRef{FactID: artifact.FactID, RecordHash: otherDigest}})
+		}},
+		{"Source invalid content", func(_, _, _, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindSourceReferenceRecorded, map[string]any{"content": mcr.ContentRef{Locator: "urn:x", SHA256: "bad"}, "anchor": "a"})
+		}},
+		{"Source empty anchor", func(_, _, _, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindSourceReferenceRecorded, map[string]any{"content": content, "anchor": ""})
+		}},
+		{"Source unknown field", func(_, _, _, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindSourceReferenceRecorded, map[string]any{"content": content, "anchor": "a", "authority": true})
+		}},
+		{"Source wrong type", func(_, _, _, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindSourceReferenceRecorded, map[string]any{"content": content, "anchor": 1})
+		}},
+		{"Evidence unknown field", func(_, claim, source, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindEvidenceLinked, map[string]any{"claim": mcr.FactRef{FactID: claim.FactID, RecordHash: claim.RecordHash}, "source": mcr.FactRef{FactID: source.FactID, RecordHash: source.RecordHash}, "proves": true})
+		}},
+		{"Evidence malformed Claim", func(_, _, source, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindEvidenceLinked, map[string]any{"claim": map[string]any{"fact_id": "fact"}, "source": mcr.FactRef{FactID: source.FactID, RecordHash: source.RecordHash}})
+		}},
+		{"Evidence malformed Source", func(_, claim, _, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindEvidenceLinked, map[string]any{"claim": mcr.FactRef{FactID: claim.FactID, RecordHash: claim.RecordHash}, "source": map[string]any{"fact_id": "fact"}})
+		}},
+		{"Evidence missing or forward Claim", func(_, _, source, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindEvidenceLinked, map[string]any{"claim": mcr.FactRef{FactID: "fact_missing", RecordHash: otherDigest}, "source": mcr.FactRef{FactID: source.FactID, RecordHash: source.RecordHash}})
+		}},
+		{"Evidence missing or forward Source", func(_, claim, _, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindEvidenceLinked, map[string]any{"claim": mcr.FactRef{FactID: claim.FactID, RecordHash: claim.RecordHash}, "source": mcr.FactRef{FactID: "fact_missing", RecordHash: otherDigest}})
+		}},
+		{"Evidence cross Task Claim", func(_, _, source, _, otherClaim, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindEvidenceLinked, map[string]any{"claim": mcr.FactRef{FactID: otherClaim.FactID, RecordHash: otherClaim.RecordHash}, "source": mcr.FactRef{FactID: source.FactID, RecordHash: source.RecordHash}})
+		}},
+		{"Evidence cross Task Source", func(_, claim, _, _, _, otherSource mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindEvidenceLinked, map[string]any{"claim": mcr.FactRef{FactID: claim.FactID, RecordHash: claim.RecordHash}, "source": mcr.FactRef{FactID: otherSource.FactID, RecordHash: otherSource.RecordHash}})
+		}},
+		{"Evidence swapped Kinds", func(_, claim, source, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindEvidenceLinked, map[string]any{"claim": mcr.FactRef{FactID: source.FactID, RecordHash: source.RecordHash}, "source": mcr.FactRef{FactID: claim.FactID, RecordHash: claim.RecordHash}})
+		}},
+		{"Evidence wrong Kind Source", func(artifact, claim, _, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindEvidenceLinked, map[string]any{"claim": mcr.FactRef{FactID: claim.FactID, RecordHash: claim.RecordHash}, "source": mcr.FactRef{FactID: artifact.FactID, RecordHash: artifact.RecordHash}})
+		}},
+		{"Evidence Claim hash mismatch", func(_, claim, source, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindEvidenceLinked, map[string]any{"claim": mcr.FactRef{FactID: claim.FactID, RecordHash: otherDigest}, "source": mcr.FactRef{FactID: source.FactID, RecordHash: source.RecordHash}})
+		}},
+		{"Evidence Source hash mismatch", func(_, claim, source, _, _, _ mcr.Fact) mcr.Submission {
+			return submission("task-1", mcr.KindEvidenceLinked, map[string]any{"claim": mcr.FactRef{FactID: claim.FactID, RecordHash: claim.RecordHash}, "source": mcr.FactRef{FactID: source.FactID, RecordHash: otherDigest}})
+		}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			workspace, err := mcr.Create(root, "workspace-invalid-evidence")
+			if err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			if _, err := workspace.Submit(validTaskSubmission("task-1")); err != nil {
+				t.Fatalf("Submit Task 1: %v", err)
+			}
+			artifact, err := workspace.Submit(submission("task-1", mcr.KindArtifactRecorded, map[string]any{"content": content}))
+			if err != nil {
+				t.Fatalf("Submit Artifact: %v", err)
+			}
+			claim, err := workspace.Submit(submission("task-1", mcr.KindClaimRecorded, map[string]any{"statement": "exact"}))
+			if err != nil {
+				t.Fatalf("Submit Claim: %v", err)
+			}
+			source, err := workspace.Submit(submission("task-1", mcr.KindSourceReferenceRecorded, map[string]any{"content": content, "anchor": "a"}))
+			if err != nil {
+				t.Fatalf("Submit Source: %v", err)
+			}
+			if _, err := workspace.Submit(validTaskSubmission("task-2")); err != nil {
+				t.Fatalf("Submit Task 2: %v", err)
+			}
+			otherArtifact, err := workspace.Submit(submission("task-2", mcr.KindArtifactRecorded, map[string]any{"content": content}))
+			if err != nil {
+				t.Fatalf("Submit other Artifact: %v", err)
+			}
+			otherClaim, err := workspace.Submit(submission("task-2", mcr.KindClaimRecorded, map[string]any{"statement": "other"}))
+			if err != nil {
+				t.Fatalf("Submit other Claim: %v", err)
+			}
+			otherSource, err := workspace.Submit(submission("task-2", mcr.KindSourceReferenceRecorded, map[string]any{"content": content, "anchor": "other"}))
+			if err != nil {
+				t.Fatalf("Submit other Source: %v", err)
+			}
+			ledgerPath := filepath.Join(root, ".mcr", "events.jsonl")
+			before, err := os.ReadFile(ledgerPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := workspace.Submit(test.make(artifact, claim, source, otherArtifact, otherClaim, otherSource)); !errors.Is(err, mcr.ErrInvalidSubmission) {
+				t.Fatalf("Submit error = %v, want ErrInvalidSubmission", err)
+			}
+			after, err := os.ReadFile(ledgerPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(after, before) {
+				t.Fatal("invalid submission changed ledger")
+			}
+		})
+	}
+}
+
 func TestRunInputArtifactRejectionsLeaveLedgerUnchanged(t *testing.T) {
 	validRun := map[string]any{"started_at": "2026-07-12T08:00:00Z", "ended_at": "2026-07-12T08:01:00Z", "outcome": "completed"}
 	content := mcr.ContentRef{Locator: "urn:example:content", SHA256: digest}
@@ -461,11 +699,11 @@ func TestNeutralSealedFixture(t *testing.T) {
 		t.Fatal(err)
 	}
 	verification, err := workspace.Verify()
-	if err != nil || verification.Integrity != mcr.IntegritySealedValid || verification.RecordCount != 5 || verification.LastRecordID != "fact_fixture_04" {
+	if err != nil || verification.Integrity != mcr.IntegritySealedValid || verification.RecordCount != 8 || verification.LastRecordID != "fact_fixture_07" {
 		t.Fatalf("Verify fixture = %+v, %v", verification, err)
 	}
 	facts, err := workspace.Query(mcr.FactQuery{})
-	if err != nil || len(facts) != 4 || facts[0].TaskID != "task-neutral" || facts[3].Kind != mcr.KindArtifactRecorded {
+	if err != nil || len(facts) != 7 || facts[0].TaskID != "task-neutral" || facts[6].Kind != mcr.KindEvidenceLinked {
 		t.Fatalf("Query fixture = %+v, %v", facts, err)
 	}
 	projection, err := workspace.Replay()
@@ -473,11 +711,14 @@ func TestNeutralSealedFixture(t *testing.T) {
 		t.Fatalf("Replay fixture = %+v, %v", projection, err)
 	}
 	task := projection.Tasks[0]
-	if task.Definition.ID != "neutral-task" || len(task.Runs) != 1 || len(task.RegisteredInputs) != 1 || len(task.Artifacts) != 1 {
+	if task.Definition.ID != "neutral-task" || len(task.Runs) != 1 || len(task.RegisteredInputs) != 1 || len(task.Artifacts) != 1 || len(task.Claims) != 1 || len(task.SourceReferences) != 1 || len(task.EvidenceLinks) != 1 {
 		t.Fatalf("Replay fixture Task = %+v", task)
 	}
 	if task.Artifacts[0].Run == nil || task.Artifacts[0].Run.FactID != task.Runs[0].SourceFactID {
 		t.Fatalf("Replay fixture provenance = %+v", task.Artifacts[0])
+	}
+	if task.Claims[0].OriginArtifact == nil || task.Claims[0].OriginArtifact.FactID != task.Artifacts[0].SourceFactID || task.EvidenceLinks[0].Claim.FactID != task.Claims[0].SourceFactID || task.EvidenceLinks[0].Source.FactID != task.SourceReferences[0].SourceFactID {
+		t.Fatalf("Replay fixture evidence = %+v", task)
 	}
 }
 
@@ -510,6 +751,35 @@ func TestCLIContracts(t *testing.T) {
 	var run mcr.Fact
 	if err := json.Unmarshal([]byte(runOut), &run); err != nil || run.Kind != mcr.KindRunRecorded || run.FactID == fact.FactID {
 		t.Fatalf("Run submit stdout = %q, %v", runOut, err)
+	}
+
+	claimPayload := `{"task_id":"task-cli","actor":{"type":"integration","id":"cli-test"},"kind":"claim.recorded","payload":{"statement":"Exact CLI statement."}}`
+	claimOut, claimErr, claimExit := runCLI(bin, claimPayload, "submit", "--workspace", root)
+	if claimExit != 0 || claimErr != "" {
+		t.Fatalf("Claim submit exit=%d stderr=%q stdout=%q", claimExit, claimErr, claimOut)
+	}
+	var claim mcr.Fact
+	if err := json.Unmarshal([]byte(claimOut), &claim); err != nil || claim.Kind != mcr.KindClaimRecorded || claim.FactID == run.FactID {
+		t.Fatalf("Claim submit stdout = %q, %v", claimOut, err)
+	}
+	sourcePayload := `{"task_id":"task-cli","actor":{"type":"integration","id":"cli-test"},"kind":"source_reference.recorded","payload":{"content":{"locator":"urn:example:cli-source","sha256":"` + digest + `"},"anchor":"section-1"}}`
+	sourceOut, sourceErr, sourceExit := runCLI(bin, sourcePayload, "submit", "--workspace", root)
+	if sourceExit != 0 || sourceErr != "" {
+		t.Fatalf("Source submit exit=%d stderr=%q stdout=%q", sourceExit, sourceErr, sourceOut)
+	}
+	var source mcr.Fact
+	if err := json.Unmarshal([]byte(sourceOut), &source); err != nil || source.Kind != mcr.KindSourceReferenceRecorded {
+		t.Fatalf("Source submit stdout = %q, %v", sourceOut, err)
+	}
+
+	evidencePayload := `{"task_id":"task-cli","actor":{"type":"integration","id":"cli-test"},"kind":"evidence.linked","payload":{"claim":{"fact_id":"` + claim.FactID + `","record_hash":"` + claim.RecordHash + `"},"source":{"fact_id":"` + source.FactID + `","record_hash":"` + source.RecordHash + `"}}}`
+	evidenceOut, evidenceErr, evidenceExit := runCLI(bin, evidencePayload, "submit", "--workspace", root)
+	if evidenceExit != 0 || evidenceErr != "" {
+		t.Fatalf("Evidence submit exit=%d stderr=%q stdout=%q", evidenceExit, evidenceErr, evidenceOut)
+	}
+	var evidence mcr.Fact
+	if err := json.Unmarshal([]byte(evidenceOut), &evidence); err != nil || evidence.Kind != mcr.KindEvidenceLinked {
+		t.Fatalf("Evidence submit stdout = %q, %v", evidenceOut, err)
 	}
 
 	duplicate := `{"task_id":"task-shadow","task_id":"task-duplicate","actor":{"type":"integration","id":"cli-test"},"kind":"task.created","payload":{"definition":{"namespace":"example.test","id":"duplicate","version":"v1","locator":"urn:example:duplicate:v1","sha256":"` + digest + `"}}}`

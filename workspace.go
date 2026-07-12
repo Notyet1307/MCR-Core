@@ -60,6 +60,21 @@ type artifactPayload struct {
 	Run     *FactRef
 }
 
+type claimPayload struct {
+	Statement      string
+	OriginArtifact *FactRef
+}
+
+type sourceReferencePayload struct {
+	Content ContentRef `json:"content"`
+	Anchor  string     `json:"anchor"`
+}
+
+type evidenceLinkPayload struct {
+	Claim  FactRef `json:"claim"`
+	Source FactRef `json:"source"`
+}
+
 type nativeState struct {
 	tasks map[string]bool
 	facts map[string]Fact
@@ -82,7 +97,7 @@ func (s *nativeState) add(fact Fact) {
 
 func (s *nativeState) validate(taskID, kind string, payload json.RawMessage) (string, error) {
 	switch kind {
-	case KindTaskCreated, KindRunRecorded, KindInputRegistered, KindArtifactRecorded:
+	case KindTaskCreated, KindRunRecorded, KindInputRegistered, KindArtifactRecorded, KindClaimRecorded, KindSourceReferenceRecorded, KindEvidenceLinked:
 	default:
 		return "unknown_kind", errors.New("native fact kind is not supported")
 	}
@@ -105,7 +120,24 @@ func (s *nativeState) validate(taskID, kind string, payload json.RawMessage) (st
 		var artifact artifactPayload
 		artifact, err = decodeArtifactPayload(payload)
 		if err == nil {
-			err = validateArtifactRun(taskID, artifact.Run, s.facts)
+			err = validateFactReference(taskID, artifact.Run, s.facts, KindRunRecorded, "artifact run")
+		}
+	case KindClaimRecorded:
+		var claim claimPayload
+		claim, err = decodeClaimPayload(payload)
+		if err == nil {
+			err = validateFactReference(taskID, claim.OriginArtifact, s.facts, KindArtifactRecorded, "claim origin Artifact")
+		}
+	case KindSourceReferenceRecorded:
+		_, err = decodeSourceReferencePayload(payload)
+	case KindEvidenceLinked:
+		var evidence evidenceLinkPayload
+		evidence, err = decodeEvidenceLinkPayload(payload)
+		if err == nil {
+			err = validateFactReference(taskID, &evidence.Claim, s.facts, KindClaimRecorded, "evidence Claim")
+		}
+		if err == nil {
+			err = validateFactReference(taskID, &evidence.Source, s.facts, KindSourceReferenceRecorded, "evidence Source Reference")
 		}
 	}
 	return "invalid_payload", err
@@ -268,6 +300,7 @@ func (w *Workspace) Replay() (Projection, error) {
 			projection.Tasks = append(projection.Tasks, TaskProjection{
 				TaskID: fact.TaskID, SourceFactID: fact.FactID, Definition: definition,
 				Runs: []RunProjection{}, RegisteredInputs: []RegisteredInputProjection{}, Artifacts: []ArtifactProjection{},
+				Claims: []ClaimProjection{}, SourceReferences: []SourceReferenceProjection{}, EvidenceLinks: []EvidenceLinkProjection{},
 			})
 		case KindRunRecorded:
 			payload, _ := decodeRunPayload(fact.Payload)
@@ -283,6 +316,18 @@ func (w *Workspace) Replay() (Projection, error) {
 			payload, _ := decodeArtifactPayload(fact.Payload)
 			task := &projection.Tasks[taskIndexes[fact.TaskID]]
 			task.Artifacts = append(task.Artifacts, ArtifactProjection{SourceFactID: fact.FactID, Content: payload.Content, Run: payload.Run})
+		case KindClaimRecorded:
+			payload, _ := decodeClaimPayload(fact.Payload)
+			task := &projection.Tasks[taskIndexes[fact.TaskID]]
+			task.Claims = append(task.Claims, ClaimProjection{SourceFactID: fact.FactID, Statement: payload.Statement, OriginArtifact: payload.OriginArtifact})
+		case KindSourceReferenceRecorded:
+			payload, _ := decodeSourceReferencePayload(fact.Payload)
+			task := &projection.Tasks[taskIndexes[fact.TaskID]]
+			task.SourceReferences = append(task.SourceReferences, SourceReferenceProjection{SourceFactID: fact.FactID, Content: payload.Content, Anchor: payload.Anchor})
+		case KindEvidenceLinked:
+			payload, _ := decodeEvidenceLinkPayload(fact.Payload)
+			task := &projection.Tasks[taskIndexes[fact.TaskID]]
+			task.EvidenceLinks = append(task.EvidenceLinks, EvidenceLinkProjection{SourceFactID: fact.FactID, Claim: payload.Claim, Source: payload.Source})
 		}
 	}
 	return projection, nil
@@ -483,22 +528,86 @@ func decodeArtifactPayload(raw json.RawMessage) (artifactPayload, error) {
 	return payload, nil
 }
 
-func validateArtifactRun(taskID string, ref *FactRef, prior map[string]Fact) error {
+func decodeClaimPayload(raw json.RawMessage) (claimPayload, error) {
+	if err := jsonstrict.Validate(raw); err != nil {
+		return claimPayload{}, err
+	}
+	var encoded struct {
+		Statement      string          `json:"statement"`
+		OriginArtifact json.RawMessage `json:"origin_artifact"`
+	}
+	if err := strictDecode(raw, &encoded); err != nil {
+		return claimPayload{}, fmt.Errorf("invalid claim payload: %w", err)
+	}
+	if encoded.Statement == "" {
+		return claimPayload{}, errors.New("claim requires a non-empty statement")
+	}
+	payload := claimPayload{Statement: encoded.Statement}
+	if len(encoded.OriginArtifact) == 0 {
+		return payload, nil
+	}
+	var ref FactRef
+	if err := strictDecode(encoded.OriginArtifact, &ref); err != nil || !validFactRef(ref) {
+		return claimPayload{}, errors.New("claim origin Artifact must be an exact Fact Reference")
+	}
+	payload.OriginArtifact = &ref
+	return payload, nil
+}
+
+func decodeSourceReferencePayload(raw json.RawMessage) (sourceReferencePayload, error) {
+	if err := jsonstrict.Validate(raw); err != nil {
+		return sourceReferencePayload{}, err
+	}
+	var payload struct {
+		Content ContentRef `json:"content"`
+		Anchor  string     `json:"anchor"`
+	}
+	if err := strictDecode(raw, &payload); err != nil {
+		return sourceReferencePayload{}, fmt.Errorf("invalid source reference payload: %w", err)
+	}
+	if err := validateContentRef(payload.Content); err != nil {
+		return sourceReferencePayload{}, err
+	}
+	if payload.Anchor == "" {
+		return sourceReferencePayload{}, errors.New("source reference requires a non-empty anchor")
+	}
+	return sourceReferencePayload(payload), nil
+}
+
+func decodeEvidenceLinkPayload(raw json.RawMessage) (evidenceLinkPayload, error) {
+	if err := jsonstrict.Validate(raw); err != nil {
+		return evidenceLinkPayload{}, err
+	}
+	var payload evidenceLinkPayload
+	if err := strictDecode(raw, &payload); err != nil {
+		return evidenceLinkPayload{}, fmt.Errorf("invalid evidence link payload: %w", err)
+	}
+	if !validFactRef(payload.Claim) || !validFactRef(payload.Source) {
+		return evidenceLinkPayload{}, errors.New("evidence link requires exact Claim and Source References")
+	}
+	return payload, nil
+}
+
+func validFactRef(ref FactRef) bool {
+	return ref.FactID != "" && nativeHash.MatchString(ref.RecordHash)
+}
+
+func validateFactReference(taskID string, ref *FactRef, prior map[string]Fact, kind, name string) error {
 	if ref == nil {
 		return nil
 	}
 	fact, found := prior[ref.FactID]
 	if !found {
-		return errors.New("artifact run does not reference an earlier Fact")
+		return fmt.Errorf("%s does not reference an earlier Fact", name)
 	}
 	if fact.TaskID != taskID {
-		return errors.New("artifact run must belong to the same Task")
+		return fmt.Errorf("%s must belong to the same Task", name)
 	}
-	if fact.Kind != KindRunRecorded {
-		return errors.New("artifact run must reference a Run")
+	if fact.Kind != kind {
+		return fmt.Errorf("%s must reference %s", name, kind)
 	}
 	if fact.RecordHash != ref.RecordHash {
-		return errors.New("artifact run record hash does not match")
+		return fmt.Errorf("%s record hash does not match", name)
 	}
 	return nil
 }
