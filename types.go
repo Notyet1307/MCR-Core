@@ -20,6 +20,9 @@ const (
 	KindDeliveryRecorded        = "delivery.recorded"
 	KindOpaqueRecorded          = "opaque.recorded"
 	IntegritySealedValid        = "sealed_valid"
+	IntegrityUnsealed           = "unsealed"
+	IntegrityPartialInvalid     = "partial_invalid"
+	IntegritySealedInvalid      = "sealed_invalid"
 	FormatNative                = "mcr-core/v1"
 )
 

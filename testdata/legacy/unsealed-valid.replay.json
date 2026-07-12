@@ -1,0 +1,44 @@
+{
+  "workspace_id": "workspace/unsealed",
+  "format": "legacy",
+  "integrity": "unsealed",
+  "tasks": [
+    {
+      "task_id": "task/u?opaque",
+      "source_fact_id": "task@u-9",
+      "definition": {
+        "namespace": "example",
+        "id": "unsealed-task",
+        "version": "1.0.0",
+        "locator": "defs/unsealed.json",
+        "sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "runs": [],
+      "registered_inputs": [
+        {
+          "source_fact_id": "input#bare",
+          "content": {
+            "locator": "inputs/neutral.txt",
+            "sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+        }
+      ],
+      "artifacts": [],
+      "claims": [],
+      "source_references": [],
+      "evidence_links": [],
+      "reviews": [],
+      "approvals": [],
+      "policy_decisions": [],
+      "deliveries": [],
+      "opaque_facts": [
+        {
+          "source_fact_id": "extension+opaque",
+          "kind": "FutureNeutralEvent",
+          "data": {"task_id":"task/u?opaque","note":"preserve","additive_extension":{"v":1}}
+        }
+      ]
+    }
+  ],
+  "opaque_facts": []
+}

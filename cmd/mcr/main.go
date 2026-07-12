@@ -97,6 +97,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		if err := encoder.Encode(verification); err != nil {
 			return fail(stderr, err.Error())
 		}
+		if len(verification.Diagnostics) != 0 {
+			if err := json.NewEncoder(stderr).Encode(verification.Diagnostics); err != nil {
+				return 2
+			}
+		}
 		if verification.Integrity != mcr.IntegritySealedValid {
 			return 1
 		}

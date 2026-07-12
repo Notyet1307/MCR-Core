@@ -974,14 +974,17 @@ func TestNeutralSealedFixture(t *testing.T) {
 	if err != nil || verification.Integrity != mcr.IntegritySealedValid || verification.RecordCount != 15 || verification.LastRecordID != "fact_fixture_14" {
 		t.Fatalf("Verify fixture = %+v, %v", verification, err)
 	}
+	assertJSONGolden(t, "testdata/hashes/native-task.verify.json", verification)
 	facts, err := workspace.Query(mcr.FactQuery{})
 	if err != nil || len(facts) != 14 || facts[0].TaskID != "task-neutral" || facts[13].TaskID != "task-secondary" || facts[13].Kind != mcr.KindTaskCreated {
 		t.Fatalf("Query fixture = %+v, %v", facts, err)
 	}
+	assertJSONGolden(t, "testdata/hashes/native-task.query.json", facts)
 	projection, err := workspace.Replay()
 	if err != nil || len(projection.Tasks) != 2 {
 		t.Fatalf("Replay fixture = %+v, %v", projection, err)
 	}
+	assertJSONGolden(t, "testdata/hashes/native-task.replay.json", projection)
 	task := projection.Tasks[0]
 	if task.Definition.ID != "neutral-task" || len(task.Runs) != 1 || len(task.RegisteredInputs) != 1 || len(task.Artifacts) != 2 || len(task.Claims) != 1 || len(task.SourceReferences) != 1 || len(task.EvidenceLinks) != 1 || len(task.Reviews) != 1 || len(task.Approvals) != 1 || len(task.PolicyDecisions) != 1 || len(task.Deliveries) != 1 || len(task.OpaqueFacts) != 1 {
 		t.Fatalf("Replay fixture Task = %+v", task)
@@ -1098,6 +1101,128 @@ func TestCLIContracts(t *testing.T) {
 	stdout, stderr, exit = runCLI(bin, "", "query")
 	if exit == 0 || stdout != "" || stderr == "" || !json.Valid([]byte(stderr)) {
 		t.Fatalf("missing workspace exit=%d stderr=%q stdout=%q", exit, stderr, stdout)
+	}
+}
+
+func TestCLILegacyVerifyExitMatrix(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "mcr")
+	build := exec.Command("go", "build", "-o", bin, "./cmd/mcr")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build CLI: %v\n%s", err, output)
+	}
+	sealed, err := os.ReadFile("testdata/legacy/sealed-valid.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unsealed, err := os.ReadFile("testdata/legacy/unsealed-valid.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name      string
+		ledger    []byte
+		state     []byte
+		exit      int
+		integrity string
+		stderr    bool
+	}{
+		{name: "sealed-valid-cache-warning", ledger: sealed, state: nil, exit: 0, integrity: mcr.IntegritySealedValid, stderr: true},
+		{name: "unsealed", ledger: unsealed, state: []byte(`{"workspace_id":"workspace/unsealed","last_event_id":"extension+opaque"}`), exit: 1, integrity: mcr.IntegrityUnsealed},
+		{name: "partial", ledger: mutateLegacyRecord(t, sealed, 2, func(values map[string]any) { delete(values, "event_hash") }), state: []byte(`{}`), exit: 1, integrity: mcr.IntegrityPartialInvalid, stderr: true},
+		{name: "sealed-invalid", ledger: bytes.Replace(sealed, []byte(firstLegacyEventHash), []byte("sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"), 1), state: []byte(`{}`), exit: 1, integrity: mcr.IntegritySealedInvalid, stderr: true},
+		{name: "structural-invalid", ledger: mutateLegacyRecord(t, sealed, 2, func(values map[string]any) { delete(values, "actor") }), state: []byte(`{}`), exit: 1, stderr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			workspace := writeLegacyWorkspace(t, test.ledger, test.state)
+			stdout, stderr, exit := runCLI(bin, "", "verify", "--workspace", workspace)
+			if exit != test.exit || !json.Valid([]byte(stdout)) || (test.stderr != (stderr != "")) || (stderr != "" && !json.Valid([]byte(stderr))) {
+				t.Fatalf("exit=%d stderr=%q stdout=%q", exit, stderr, stdout)
+			}
+			var verification mcr.Verification
+			if err := json.Unmarshal([]byte(stdout), &verification); err != nil || verification.Integrity != test.integrity {
+				t.Fatalf("verification=%#v, %v", verification, err)
+			}
+		})
+	}
+}
+
+func TestCLISharedGoldensAndErrorMatrix(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "mcr")
+	build := exec.Command("go", "build", "-o", bin, "./cmd/mcr")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build CLI: %v\n%s", err, output)
+	}
+	fixture, err := os.ReadFile("testdata/native-task.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	mcrDir := filepath.Join(root, ".mcr")
+	if err := os.Mkdir(mcrDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mcrDir, "events.jsonl"), fixture, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	queryOut, queryErr, queryExit := runCLI(bin, "", "query", "--workspace", root)
+	if queryExit != 0 || queryErr != "" {
+		t.Fatalf("query exit=%d stderr=%q stdout=%q", queryExit, queryErr, queryOut)
+	}
+	var facts []mcr.Fact
+	if err := json.Unmarshal([]byte(queryOut), &facts); err != nil {
+		t.Fatalf("query JSON: %v", err)
+	}
+	assertJSONGolden(t, "testdata/hashes/native-task.query.json", facts)
+
+	replayOut, replayErr, replayExit := runCLI(bin, "", "replay", "--workspace", root)
+	if replayExit != 0 || replayErr != "" {
+		t.Fatalf("replay exit=%d stderr=%q stdout=%q", replayExit, replayErr, replayOut)
+	}
+	var projection mcr.Projection
+	if err := json.Unmarshal([]byte(replayOut), &projection); err != nil {
+		t.Fatalf("replay JSON: %v", err)
+	}
+	assertJSONGolden(t, "testdata/hashes/native-task.replay.json", projection)
+
+	verifyOut, verifyErr, verifyExit := runCLI(bin, "", "verify", "--workspace", root)
+	if verifyExit != 0 || verifyErr != "" {
+		t.Fatalf("verify exit=%d stderr=%q stdout=%q", verifyExit, verifyErr, verifyOut)
+	}
+	var verification mcr.Verification
+	if err := json.Unmarshal([]byte(verifyOut), &verification); err != nil {
+		t.Fatalf("verify JSON: %v", err)
+	}
+	assertJSONGolden(t, "testdata/hashes/native-task.verify.json", verification)
+
+	partial, err := os.ReadFile("testdata/legacy/sealed-valid.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	partial = mutateLegacyRecord(t, partial, 2, func(values map[string]any) { delete(values, "event_hash") })
+	partialWorkspace := writeLegacyWorkspace(t, partial, []byte("{}\n"))
+	tests := []struct {
+		name  string
+		stdin string
+		args  []string
+	}{
+		{name: "unknown-command", args: []string{"unknown", "--workspace", root}},
+		{name: "open-error", args: []string{"query", "--workspace", filepath.Join(t.TempDir(), "missing")}},
+		{name: "read-operation-error", args: []string{"query", "--workspace", partialWorkspace}},
+		{name: "submission-operation-error", stdin: "{}", args: []string{"submit", "--workspace", root}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			stdout, stderr, exit := runCLI(bin, test.stdin, test.args...)
+			if exit != 2 || stdout != "" || !json.Valid([]byte(stderr)) {
+				t.Fatalf("exit=%d stderr=%q stdout=%q", exit, stderr, stdout)
+			}
+			var diagnostic map[string]string
+			if err := json.Unmarshal([]byte(stderr), &diagnostic); err != nil || diagnostic["error"] == "" {
+				t.Fatalf("stderr diagnostic = %#v, %v", diagnostic, err)
+			}
+		})
 	}
 }
 

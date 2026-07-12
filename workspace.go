@@ -322,11 +322,11 @@ func (w *Workspace) Submit(submission Submission) (Fact, error) {
 	if err != nil {
 		return zero, err
 	}
-	if !verification.StructuralValid || verification.Integrity != IntegritySealedValid {
+	if !acceptedHistory(verification) {
 		return zero, fmt.Errorf("%w: workspace ledger is not valid", ErrInvalidHistory)
 	}
 	if h.readOnly {
-		return zero, fmt.Errorf("%w: sealed legacy workspace", ErrReadOnly)
+		return zero, fmt.Errorf("%w: legacy workspace", ErrReadOnly)
 	}
 	if err := validateSubmission(submission, h); err != nil {
 		return zero, err
@@ -379,7 +379,7 @@ func (w *Workspace) Query(query FactQuery) ([]Fact, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !verification.StructuralValid || verification.Integrity != IntegritySealedValid {
+	if !acceptedHistory(verification) {
 		return nil, fmt.Errorf("%w: workspace ledger is not valid", ErrInvalidHistory)
 	}
 	facts := make([]Fact, 0, len(h.facts))
@@ -404,14 +404,18 @@ func (w *Workspace) Replay() (Projection, error) {
 	if err != nil {
 		return Projection{}, err
 	}
-	if !verification.StructuralValid || verification.Integrity != IntegritySealedValid {
+	if !acceptedHistory(verification) {
 		return Projection{}, fmt.Errorf("%w: workspace ledger is not valid", ErrInvalidHistory)
 	}
-	return projectHistory(h, verification.Format), nil
+	return projectHistory(h, verification.Format, verification.Integrity), nil
 }
 
-func projectHistory(h history, format string) Projection {
-	projection := Projection{WorkspaceID: h.header.WorkspaceID, Format: format, Integrity: IntegritySealedValid, Tasks: make([]TaskProjection, 0, len(h.facts)), OpaqueFacts: []OpaqueFactProjection{}}
+func acceptedHistory(verification Verification) bool {
+	return verification.StructuralValid && (verification.Integrity == IntegritySealedValid || verification.Integrity == IntegrityUnsealed)
+}
+
+func projectHistory(h history, format, integrity string) Projection {
+	projection := Projection{WorkspaceID: h.header.WorkspaceID, Format: format, Integrity: integrity, Tasks: make([]TaskProjection, 0, len(h.facts)), OpaqueFacts: []OpaqueFactProjection{}}
 	taskIndexes := make(map[string]int)
 	for index, fact := range h.facts {
 		payload := fact.Payload
@@ -514,7 +518,58 @@ func (w *Workspace) readHistory() (history, Verification, error) {
 	if err != nil {
 		return history{}, Verification{}, fmt.Errorf("read workspace ledger: %w", err)
 	}
+	if format == formatLegacy {
+		verification.Diagnostics = append(verification.Diagnostics, inspectLegacyCache(w.path, h, verification)...)
+	}
 	return h, verification, nil
+}
+
+func inspectLegacyCache(workspacePath string, h history, verification Verification) []Diagnostic {
+	cachePath := filepath.Join(workspacePath, ".mcr", "state.json")
+	cache, _, err := openRegular(cachePath)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return []Diagnostic{{Code: "legacy_cache_missing", Message: "legacy state cache is missing"}}
+		}
+		if errors.Is(err, ErrConflict) {
+			return []Diagnostic{{Code: "legacy_cache_not_regular", Message: "legacy state cache must be a regular file"}}
+		}
+		return []Diagnostic{{Code: "legacy_cache_unreadable", Message: "legacy state cache cannot be inspected"}}
+	}
+	data, readErr := io.ReadAll(cache)
+	closeErr := cache.Close()
+	if readErr != nil || closeErr != nil {
+		return []Diagnostic{{Code: "legacy_cache_unreadable", Message: "legacy state cache cannot be read"}}
+	}
+	if err := jsonstrict.Validate(data); err != nil {
+		return []Diagnostic{{Code: "legacy_cache_invalid_json", Message: "legacy state cache is not strict JSON"}}
+	}
+	fields, err := decodeOrderedObject(data)
+	if err != nil {
+		return []Diagnostic{{Code: "legacy_cache_not_object", Message: "legacy state cache must be a JSON object"}}
+	}
+	values := make(map[string]json.RawMessage, len(fields))
+	for _, field := range fields {
+		values[field.name] = field.raw
+	}
+	diagnostics := make([]Diagnostic, 0, 2)
+	if raw, ok := values["workspace_id"]; ok {
+		var workspaceID string
+		if json.Unmarshal(raw, &workspaceID) != nil {
+			diagnostics = append(diagnostics, Diagnostic{Code: "legacy_cache_invalid_workspace", Message: "legacy state cache workspace_id must be a string"})
+		} else if h.header.WorkspaceID != "" && workspaceID != h.header.WorkspaceID {
+			diagnostics = append(diagnostics, Diagnostic{Code: "legacy_cache_workspace_mismatch", Message: "legacy state cache workspace_id does not match Events"})
+		}
+	}
+	if raw, ok := values["last_event_id"]; ok {
+		var lastEventID string
+		if json.Unmarshal(raw, &lastEventID) != nil {
+			diagnostics = append(diagnostics, Diagnostic{Code: "legacy_cache_invalid_last_event", Message: "legacy state cache last_event_id must be a string"})
+		} else if verification.LastRecordID != "" && lastEventID != verification.LastRecordID {
+			diagnostics = append(diagnostics, Diagnostic{Code: "legacy_cache_last_event_stale", Message: "legacy state cache last_event_id does not match Events"})
+		}
+	}
+	return diagnostics
 }
 
 func parseNative(ledger io.ReadSeeker) (history, Verification, error) {
@@ -563,6 +618,7 @@ func parseNative(ledger io.ReadSeeker) (history, Verification, error) {
 
 	h := history{header: header, facts: make([]Fact, 0, recordCount-1)}
 	state := newNativeState(nil)
+	seenFactIDs := make(map[string]bool, recordCount-1)
 	previousHash := header.RecordHash
 	lastID := header.WorkspaceID
 	for number := 2; number <= recordCount; number++ {
@@ -581,6 +637,10 @@ func parseNative(ledger io.ReadSeeker) (history, Verification, error) {
 		if err := strictDecode(line, &record); err != nil || record.RecordType != "fact" || record.FactID == "" || record.TaskID == "" || record.Actor.Type == "" || record.Actor.ID == "" || !validUTCTimestamp(record.RecordedAt) || !nativeHash.MatchString(record.PrevHash) || !nativeHash.MatchString(record.RecordHash) {
 			return history{}, invalidVerificationWithCount("invalid_fact_envelope", number, record.FactID, "fact envelope values are invalid", recordCount), nil
 		}
+		if seenFactIDs[record.FactID] {
+			return history{}, invalidVerificationWithCount("duplicate_fact_id", number, record.FactID, "Fact ID is not unique", recordCount), nil
+		}
+		seenFactIDs[record.FactID] = true
 		if record.PrevHash != previousHash {
 			return history{}, invalidVerificationWithCount("previous_hash_mismatch", number, record.FactID, "previous hash does not match", recordCount), nil
 		}
@@ -1081,7 +1141,7 @@ func openDirectory(path string) (*os.File, error) {
 }
 
 func openRegular(path string) (*os.File, os.FileInfo, error) {
-	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		if errors.Is(err, syscall.ELOOP) {
 			return nil, nil, fmt.Errorf("%w: %s is not a regular file: %w", ErrConflict, path, err)

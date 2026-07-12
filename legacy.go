@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/Notyet1307/MCR-Core/internal/jsonstrict"
@@ -16,13 +17,15 @@ import (
 const formatLegacy = "legacy"
 
 type legacyEvent struct {
-	EventID   string          `json:"event_id"`
-	EventType string          `json:"event_type"`
-	Timestamp string          `json:"timestamp"`
-	Actor     Actor           `json:"actor"`
-	PrevHash  string          `json:"prev_hash"`
-	EventHash string          `json:"event_hash"`
-	Payload   json.RawMessage `json:"payload"`
+	EventID      string          `json:"event_id"`
+	EventType    string          `json:"event_type"`
+	Timestamp    string          `json:"timestamp"`
+	Actor        Actor           `json:"actor"`
+	PrevHash     string          `json:"prev_hash"`
+	EventHash    string          `json:"event_hash"`
+	Payload      json.RawMessage `json:"payload"`
+	prevPresent  bool
+	eventPresent bool
 }
 
 func detectHistoryFormat(ledger io.ReadSeeker) (string, error) {
@@ -43,20 +46,11 @@ func detectHistoryFormat(ledger io.ReadSeeker) (string, error) {
 			return "native", nil
 		}
 		var eventType string
-		if raw, ok := fields["event_type"]; ok && json.Unmarshal(raw, &eventType) == nil && eventType == "McrInitialized" && hasLegacyEnvelope(fields) {
+		if raw, ok := fields["event_type"]; ok && json.Unmarshal(raw, &eventType) == nil && eventType == "McrInitialized" {
 			return formatLegacy, nil
 		}
 	}
 	return "native", nil
-}
-
-func hasLegacyEnvelope(fields map[string]json.RawMessage) bool {
-	for _, name := range []string{"event_id", "event_type", "timestamp", "actor", "prev_hash", "event_hash", "payload"} {
-		if _, ok := fields[name]; !ok {
-			return false
-		}
-	}
-	return true
 }
 
 func parseLegacy(ledger io.ReadSeeker) (history, Verification, error) {
@@ -80,10 +74,10 @@ func parseLegacy(ledger io.ReadSeeker) (history, Verification, error) {
 	}
 
 	h := history{format: formatLegacy, readOnly: true, facts: make([]Fact, 0, recordCount-1), semanticPayloads: make([]json.RawMessage, 0, recordCount-1), semanticTaskIDs: make([]string, 0, recordCount-1), rawLines: make([][]byte, 0, recordCount)}
+	events := make([]legacyEvent, 0, recordCount)
 	reader := bufio.NewReader(ledger)
 	seen := make(map[string]bool, recordCount)
 	state := newNativeState(nil)
-	previousHash := zeroHash
 	lastID := ""
 	for number := 1; number <= recordCount; number++ {
 		line, err := readNativeRecord(reader)
@@ -99,16 +93,6 @@ func parseLegacy(ledger io.ReadSeeker) (history, Verification, error) {
 			return history{}, invalidLegacyVerification("duplicate_event_id", number, event.EventID, "legacy event ID is not unique", recordCount), nil
 		}
 		seen[event.EventID] = true
-		if event.PrevHash != previousHash {
-			return history{}, invalidLegacyVerification("previous_hash_mismatch", number, event.EventID, "previous hash does not match", recordCount), nil
-		}
-		expected, err := hashLegacyEvent(event)
-		if err != nil {
-			return history{}, Verification{}, err
-		}
-		if event.EventHash != expected {
-			return history{}, invalidLegacyVerification("event_hash_mismatch", number, event.EventID, "legacy event hash does not match", recordCount), nil
-		}
 		if number == 1 {
 			workspaceID, ok := legacyString(event.Payload, "workspace_id")
 			if event.EventType != "McrInitialized" || !ok || workspaceID == "" {
@@ -121,10 +105,6 @@ func parseLegacy(ledger io.ReadSeeker) (history, Verification, error) {
 			}
 			fact, semanticTaskID, semanticPayload := normalizeLegacyEvent(event, state)
 			code, validateErr := state.validate(semanticTaskID, fact.Kind, semanticPayload)
-			if validateErr != nil && fact.Kind != KindOpaqueRecorded {
-				fact, semanticTaskID, semanticPayload = opaqueLegacyFact(event, state, "legacy_underbound")
-				code, validateErr = state.validate(semanticTaskID, fact.Kind, semanticPayload)
-			}
 			if validateErr != nil {
 				return history{}, invalidLegacyVerification(code, number, event.EventID, validateErr.Error(), recordCount), nil
 			}
@@ -133,12 +113,12 @@ func parseLegacy(ledger io.ReadSeeker) (history, Verification, error) {
 			h.semanticPayloads = append(h.semanticPayloads, semanticPayload)
 			state.add(fact)
 		}
-		previousHash = event.EventHash
+		events = append(events, event)
 		lastID = event.EventID
 	}
 	v.StructuralValid = true
-	v.Integrity = IntegritySealedValid
 	v.LastRecordID = lastID
+	v.Integrity, v.Diagnostics = classifyLegacyIntegrity(events)
 	return h, v, nil
 }
 
@@ -158,7 +138,7 @@ func decodeLegacyEvent(line []byte, number, count int) (legacyEvent, *Verificati
 	for _, field := range fields {
 		fieldSet[field.name] = true
 	}
-	for _, required := range []string{"event_id", "event_type", "timestamp", "actor", "prev_hash", "event_hash", "payload"} {
+	for _, required := range []string{"event_id", "event_type", "timestamp", "actor", "payload"} {
 		if !fieldSet[required] {
 			return invalid("legacy event is missing required envelope fields", "")
 		}
@@ -167,13 +147,68 @@ func decodeLegacyEvent(line []byte, number, count int) (legacyEvent, *Verificati
 	if err := json.Unmarshal(line, &event); err != nil {
 		return invalid(err.Error(), "")
 	}
-	if event.EventID == "" || event.EventType == "" || event.Actor.Type == "" || event.Actor.ID == "" || !validUTCTimestamp(event.Timestamp) || !nativeHash.MatchString(event.PrevHash) || !nativeHash.MatchString(event.EventHash) {
+	event.prevPresent = fieldSet["prev_hash"]
+	event.eventPresent = fieldSet["event_hash"]
+	if event.EventID == "" || event.EventType == "" || event.Actor.Type == "" || event.Actor.ID == "" || !validUTCTimestamp(event.Timestamp) {
 		return invalid("legacy event envelope values are invalid", event.EventID)
 	}
 	if _, err := decodeOrderedObject(event.Payload); err != nil {
 		return invalid("legacy event payload must be a JSON object", event.EventID)
 	}
 	return event, nil
+}
+
+func classifyLegacyIntegrity(events []legacyEvent) (string, []Diagnostic) {
+	allAbsent, allPresent := true, true
+	for _, event := range events {
+		allAbsent = allAbsent && !event.prevPresent && !event.eventPresent
+		allPresent = allPresent && event.prevPresent && event.eventPresent
+	}
+	if allAbsent {
+		return IntegrityUnsealed, []Diagnostic{}
+	}
+	if !allPresent {
+		diagnostics := make([]Diagnostic, 0)
+		for index, event := range events {
+			if !event.prevPresent {
+				diagnostics = append(diagnostics, legacyIntegrityDiagnostic("missing_previous_hash", index+1, event.EventID, "legacy event is missing prev_hash"))
+			}
+			if !event.eventPresent {
+				diagnostics = append(diagnostics, legacyIntegrityDiagnostic("missing_event_hash", index+1, event.EventID, "legacy event is missing event_hash"))
+			}
+		}
+		return IntegrityPartialInvalid, diagnostics
+	}
+	diagnostics := make([]Diagnostic, 0)
+	previousHash := zeroHash
+	for index, event := range events {
+		previousValid := nativeHash.MatchString(event.PrevHash)
+		eventValid := nativeHash.MatchString(event.EventHash)
+		if !previousValid {
+			diagnostics = append(diagnostics, legacyIntegrityDiagnostic("invalid_previous_hash", index+1, event.EventID, "legacy previous hash spelling is invalid"))
+		}
+		if !eventValid {
+			diagnostics = append(diagnostics, legacyIntegrityDiagnostic("invalid_event_hash", index+1, event.EventID, "legacy event hash spelling is invalid"))
+		}
+		if previousValid && event.PrevHash != previousHash {
+			diagnostics = append(diagnostics, legacyIntegrityDiagnostic("previous_hash_mismatch", index+1, event.EventID, "previous hash does not match"))
+		}
+		if previousValid {
+			expected, err := hashLegacyEvent(event)
+			if err == nil && eventValid && event.EventHash != expected {
+				diagnostics = append(diagnostics, legacyIntegrityDiagnostic("event_hash_mismatch", index+1, event.EventID, "legacy event hash does not match"))
+			}
+		}
+		previousHash = event.EventHash
+	}
+	if len(diagnostics) != 0 {
+		return IntegritySealedInvalid, diagnostics
+	}
+	return IntegritySealedValid, diagnostics
+}
+
+func legacyIntegrityDiagnostic(code string, number int, id, message string) Diagnostic {
+	return Diagnostic{Code: code, RecordNumber: number, RecordID: id, Message: message}
 }
 
 func hashLegacyEvent(event legacyEvent) (string, error) {
@@ -196,6 +231,7 @@ func normalizeLegacyEvent(event legacyEvent, state nativeState) (Fact, string, j
 	kind := ""
 	var semantic json.RawMessage
 	values := legacyObject(event.Payload)
+	sourceComplete := false
 	switch event.EventType {
 	case "TaskCreated":
 		kind = KindTaskCreated
@@ -210,33 +246,21 @@ func normalizeLegacyEvent(event legacyEvent, state nativeState) (Fact, string, j
 			Outcome   json.RawMessage `json:"outcome"`
 		}{values["started_at"], values["ended_at"], values["outcome"]})
 	case "InputRegistered":
-		if content := values["content"]; len(content) != 0 {
+		if content, ok := legacyContent(values, "content", "stored_path", "sha256"); ok {
 			kind = KindInputRegistered
 			semantic = marshalLegacySemantic(struct {
 				Content json.RawMessage `json:"content"`
 			}{content})
-		} else {
-			locator, _ := legacyString(event.Payload, "stored_path")
-			sha, _ := legacyString(event.Payload, "sha256")
-			if locator != "" && nativeHash.MatchString(sha) {
-				kind = KindInputRegistered
-				semantic = marshalLegacySemantic(struct {
-					Content ContentRef `json:"content"`
-				}{ContentRef{Locator: locator, SHA256: sha}})
-			}
 		}
 	case "ArtifactAdded":
-		content := values["content"]
-		if len(content) == 0 {
-			locator := firstLegacyString(event.Payload, "locator", "path", "stored_path")
-			sha := firstLegacyString(event.Payload, "sha256", "content_hash")
-			if locator != "" && nativeHash.MatchString(sha) {
-				content = marshalLegacySemantic(ContentRef{Locator: locator, SHA256: sha})
-			}
-		}
+		content, hasContent := legacyContent(values, "content", firstPresent(values, "locator", "path", "stored_path"), firstPresent(values, "sha256", "content_hash"))
 		run := exactLegacyRef(values, "run")
-		_, claimsRun := values["run_id"]
-		if len(content) != 0 && (!claimsRun || len(run) != 0) {
+		_, claimsRunID := values["run_id"]
+		_, claimsRun := values["run"]
+		_, claimsRunFactID := values["run_fact_id"]
+		_, claimsRunRecordHash := values["run_record_hash"]
+		hasRunSource := claimsRunID || claimsRun || claimsRunFactID || claimsRunRecordHash
+		if hasContent && (!hasRunSource || (legacyRefSourceComplete(values, "run") && len(run) != 0)) {
 			kind = KindArtifactRecorded
 			semantic = marshalLegacySemantic(struct {
 				Content json.RawMessage `json:"content"`
@@ -244,19 +268,31 @@ func normalizeLegacyEvent(event legacyEvent, state nativeState) (Fact, string, j
 			}{content, run})
 		}
 	case "NarrativeDraftReviewed", "ReviewSubmitted":
-		kind = KindReviewRecorded
 		semantic = marshalSelectedWithRef(values, "subject", "outcome", "findings")
+		sourceComplete = legacyKeysPresent(values, "task_id", "outcome") && legacyRefSourceComplete(values, "subject")
+		if sourceComplete {
+			kind = KindReviewRecorded
+		}
 	case "ApprovalGranted":
-		kind = KindApprovalRecorded
 		semantic = marshalSelectedWithRef(values, "subject", "scope", "decision", "note")
+		sourceComplete = legacyKeysPresent(values, "task_id", "scope", "decision") && legacyRefSourceComplete(values, "subject")
+		if sourceComplete {
+			kind = KindApprovalRecorded
+		}
 	case "PolicyDecisionRecorded":
-		kind = KindPolicyDecisionRecorded
 		semantic = marshalSelectedWithRef(values, "subject", "action", "policy", "result")
+		sourceComplete = legacyKeysPresent(values, "task_id", "action", "policy", "result") && legacyRefSourceComplete(values, "subject")
+		if sourceComplete {
+			kind = KindPolicyDecisionRecorded
+		}
 	case "DeliveryRecorded":
-		kind = KindDeliveryRecorded
 		semantic = marshalSelected(values, "artifacts", "format", "scope", "target")
+		sourceComplete = legacyKeysPresent(values, "task_id", "artifacts", "format", "scope", "target") && legacyArtifactsSourceComplete(values["artifacts"])
+		if sourceComplete {
+			kind = KindDeliveryRecorded
+		}
 	}
-	if kind == "" || taskID == "" {
+	if kind == "" || (taskID == "" && !sourceComplete) {
 		reason := "legacy_extension"
 		if isLegacyUnderbound(event.EventType) {
 			reason = "legacy_underbound"
@@ -267,6 +303,51 @@ func normalizeLegacyEvent(event legacyEvent, state nativeState) (Fact, string, j
 	return fact, taskID, semantic
 }
 
+func legacyContent(values map[string]json.RawMessage, nestedName, locatorName, digestName string) (json.RawMessage, bool) {
+	if nested := values[nestedName]; len(nested) != 0 {
+		object := legacyObject(nested)
+		locator, locatorOK := rawString(object["locator"])
+		digest, digestOK := rawString(object["sha256"])
+		if locatorOK && digestOK {
+			digest = normalizeLegacyDigest(digest)
+			return marshalLegacySemantic(ContentRef{Locator: locator, SHA256: digest}), true
+		}
+		return nested, true
+	}
+	locator, locatorOK := rawString(values[locatorName])
+	digest, digestOK := rawString(values[digestName])
+	if !locatorOK || !digestOK {
+		return nil, false
+	}
+	return marshalLegacySemantic(ContentRef{Locator: locator, SHA256: normalizeLegacyDigest(digest)}), true
+}
+
+func firstPresent(values map[string]json.RawMessage, names ...string) string {
+	for _, name := range names {
+		if _, ok := values[name]; ok {
+			return name
+		}
+	}
+	return names[0]
+}
+
+func rawString(raw json.RawMessage) (string, bool) {
+	var value string
+	if len(raw) == 0 || json.Unmarshal(raw, &value) != nil {
+		return "", false
+	}
+	return value, true
+}
+
+func normalizeLegacyDigest(value string) string {
+	if len(value) != 64 || value != strings.ToLower(value) {
+		return value
+	}
+	if _, err := hex.DecodeString(value); err != nil {
+		return value
+	}
+	return "sha256:" + value
+}
 func opaqueLegacyFact(event legacyEvent, state nativeState, reason string) (Fact, string, json.RawMessage) {
 	taskID, _ := legacyString(event.Payload, "task_id")
 	semanticTaskID := ""
@@ -321,17 +402,53 @@ func firstLegacyString(raw json.RawMessage, names ...string) string {
 	return ""
 }
 
+func legacyKeysPresent(values map[string]json.RawMessage, names ...string) bool {
+	for _, name := range names {
+		if _, ok := values[name]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func legacyRefSourceComplete(values map[string]json.RawMessage, name string) bool {
+	if nested, ok := values[name]; ok {
+		var object map[string]json.RawMessage
+		if json.Unmarshal(nested, &object) != nil || object == nil {
+			return true
+		}
+		return legacyKeysPresent(object, "fact_id", "record_hash")
+	}
+	return legacyKeysPresent(values, name+"_fact_id", name+"_record_hash")
+}
+
+func legacyArtifactsSourceComplete(raw json.RawMessage) bool {
+	var artifacts []json.RawMessage
+	if json.Unmarshal(raw, &artifacts) != nil {
+		return true
+	}
+	for _, artifact := range artifacts {
+		var object map[string]json.RawMessage
+		if json.Unmarshal(artifact, &object) == nil && object != nil && !legacyKeysPresent(object, "fact_id", "record_hash") {
+			return false
+		}
+	}
+	return true
+}
+
 func exactLegacyRef(values map[string]json.RawMessage, name string) json.RawMessage {
-	if nested := values[name]; len(nested) != 0 {
+	if nested, ok := values[name]; ok {
 		return nested
 	}
-	var factID, recordHash string
-	_ = json.Unmarshal(values[name+"_fact_id"], &factID)
-	_ = json.Unmarshal(values[name+"_record_hash"], &recordHash)
-	if factID == "" || recordHash == "" {
+	factID, hasFactID := values[name+"_fact_id"]
+	recordHash, hasRecordHash := values[name+"_record_hash"]
+	if !hasFactID || !hasRecordHash {
 		return nil
 	}
-	return marshalLegacySemantic(FactRef{FactID: factID, RecordHash: recordHash})
+	return marshalSelected(map[string]json.RawMessage{
+		"fact_id":     factID,
+		"record_hash": recordHash,
+	}, "fact_id", "record_hash")
 }
 
 func marshalSelectedWithRef(values map[string]json.RawMessage, refName string, names ...string) json.RawMessage {

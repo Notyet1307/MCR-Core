@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"syscall"
@@ -309,6 +310,163 @@ func TestWorkspaceConcurrentWritersAndLargeRecords(t *testing.T) {
 	if err != nil || verification.Integrity != mcr.IntegritySealedValid || verification.RecordCount != wantFacts+1 {
 		t.Fatalf("Verify concurrent history = %+v, %v", verification, err)
 	}
+}
+
+func TestLegacyStorageFreshnessLargeRecordAndNoReplace(t *testing.T) {
+	unsealed, err := os.ReadFile("testdata/legacy/unsealed-valid.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	large := strings.Repeat("x", 1024*1024)
+	largeLedger := mutateLegacyRecord(t, unsealed, 4, func(values map[string]any) {
+		payload := values["payload"].(map[string]any)
+		payload["large"] = large
+	})
+	root := writeLegacyWorkspace(t, largeLedger, []byte(`{"workspace_id":"workspace/unsealed","last_event_id":"extension+opaque"}`))
+	workspace, err := mcr.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	facts, err := workspace.Query(mcr.FactQuery{FactID: "extension+opaque"})
+	if err != nil || len(facts) != 1 || len(facts[0].Payload) < len(large) {
+		t.Fatalf("Query large legacy record = %#v, %v", facts, err)
+	}
+	before := snapshotFiles(t, root)
+	invalid := mutateLegacyRecord(t, largeLedger, 2, func(values map[string]any) {
+		values["event_hash"] = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	})
+	if err := os.WriteFile(filepath.Join(root, ".mcr", "events.jsonl"), invalid, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	invalidBefore := snapshotFiles(t, root)
+	verification, err := workspace.Verify()
+	if err != nil || verification.Integrity != mcr.IntegrityPartialInvalid {
+		t.Fatalf("fresh Verify = %#v, %v", verification, err)
+	}
+	if _, err := workspace.Submit(mcr.Submission{}); !errors.Is(err, mcr.ErrInvalidHistory) {
+		t.Fatalf("Submit invalid legacy = %v", err)
+	}
+	if after := snapshotFiles(t, root); !reflect.DeepEqual(invalidBefore, after) {
+		t.Fatal("invalid legacy Submit replaced storage")
+	}
+	if reflect.DeepEqual(before, invalidBefore) {
+		t.Fatal("test did not replace ledger between operations")
+	}
+}
+
+func TestLegacyStorageContainmentLocksAndNoReplace(t *testing.T) {
+	sealed, err := os.ReadFile("testdata/legacy/sealed-valid.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unsealed, err := os.ReadFile("testdata/legacy/unsealed-valid.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	partial := mutateLegacyRecord(t, sealed, 2, func(values map[string]any) { delete(values, "event_hash") })
+	tests := []struct {
+		name      string
+		ledger    []byte
+		state     []byte
+		integrity string
+		accepted  bool
+	}{
+		{
+			name:      "sealed-valid",
+			ledger:    sealed,
+			state:     []byte(`{"workspace_id":"workspace/opaque","last_event_id":"unknown+extension"}`),
+			integrity: mcr.IntegritySealedValid,
+			accepted:  true,
+		},
+		{
+			name:      "unsealed",
+			ledger:    unsealed,
+			state:     []byte(`{"workspace_id":"workspace/unsealed","last_event_id":"extension+opaque"}`),
+			integrity: mcr.IntegrityUnsealed,
+			accepted:  true,
+		},
+		{
+			name:      "partial-invalid",
+			ledger:    partial,
+			state:     []byte(`{"workspace_id":"workspace/opaque","last_event_id":"unknown+extension"}`),
+			integrity: mcr.IntegrityPartialInvalid,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := writeLegacyWorkspace(t, test.ledger, test.state)
+			alias := filepath.Join(t.TempDir(), "workspace-alias")
+			if err := os.Symlink(root, alias); err != nil {
+				t.Fatal(err)
+			}
+			workspace, err := mcr.Open(alias)
+			if err != nil {
+				t.Fatalf("Open through contained canonical alias: %v", err)
+			}
+			before := snapshotFiles(t, root)
+			mcrDir := filepath.Join(root, ".mcr")
+			shared := lockTestDirectory(t, mcrDir, syscall.LOCK_SH)
+			verification, err := workspace.Verify()
+			if err != nil || verification.Integrity != test.integrity {
+				t.Fatalf("Verify under shared lock = %#v, %v", verification, err)
+			}
+			if _, err := workspace.Submit(mcr.Submission{}); !errors.Is(err, mcr.ErrBusy) {
+				t.Fatalf("Submit under shared lock = %v, want ErrBusy", err)
+			}
+			unlockTestDirectory(t, shared)
+
+			exclusive := lockTestDirectory(t, mcrDir, syscall.LOCK_EX)
+			if _, err := workspace.Verify(); !errors.Is(err, mcr.ErrBusy) {
+				t.Fatalf("Verify under exclusive lock = %v, want ErrBusy", err)
+			}
+			unlockTestDirectory(t, exclusive)
+
+			if test.accepted {
+				if _, err := workspace.Query(mcr.FactQuery{}); err != nil {
+					t.Fatalf("accepted Query: %v", err)
+				}
+				if _, err := workspace.Submit(mcr.Submission{}); !errors.Is(err, mcr.ErrReadOnly) {
+					t.Fatalf("accepted Submit = %v, want ErrReadOnly", err)
+				}
+			} else {
+				if _, err := workspace.Query(mcr.FactQuery{}); !errors.Is(err, mcr.ErrInvalidHistory) {
+					t.Fatalf("invalid Query = %v, want ErrInvalidHistory", err)
+				}
+				if _, err := workspace.Submit(mcr.Submission{}); !errors.Is(err, mcr.ErrInvalidHistory) {
+					t.Fatalf("invalid Submit = %v, want ErrInvalidHistory", err)
+				}
+			}
+			if after := snapshotFiles(t, root); !reflect.DeepEqual(before, after) {
+				t.Fatalf("legacy storage changed\nbefore: %#v\nafter: %#v", before, after)
+			}
+		})
+	}
+
+	t.Run("legacy-ledger-symlink-and-non-regular", func(t *testing.T) {
+		outside := filepath.Join(t.TempDir(), "legacy-events.jsonl")
+		if err := os.WriteFile(outside, sealed, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		linkedRoot := t.TempDir()
+		linkedMCR := filepath.Join(linkedRoot, ".mcr")
+		if err := os.Mkdir(linkedMCR, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, filepath.Join(linkedMCR, "events.jsonl")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := mcr.Open(linkedRoot); !errors.Is(err, mcr.ErrConflict) {
+			t.Fatalf("Open linked legacy ledger = %v, want ErrConflict", err)
+		}
+
+		directoryRoot := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(directoryRoot, ".mcr", "events.jsonl"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := mcr.Open(directoryRoot); !errors.Is(err, mcr.ErrConflict) {
+			t.Fatalf("Open non-regular legacy ledger = %v, want ErrConflict", err)
+		}
+	})
 }
 
 func TestWorkspaceConcurrentSubmitHelper(t *testing.T) {

@@ -1,0 +1,36 @@
+[
+  {
+    "fact_id": "task@u-9",
+    "task_id": "task/u?opaque",
+    "kind": "task.created",
+    "actor": {"type": "human", "id": "unsealed-tester"},
+    "recorded_at": "2025-02-03T04:05:07Z",
+    "payload": {"task_id":"task/u?opaque","definition":{"namespace":"example","id":"unsealed-task","version":"1.0.0","locator":"defs/unsealed.json","sha256":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"additive":"task-source"},
+    "prev_hash": "",
+    "record_hash": "",
+    "opaque": false
+  },
+  {
+    "fact_id": "input#bare",
+    "task_id": "task/u?opaque",
+    "kind": "input.registered",
+    "actor": {"type": "human", "id": "unsealed-tester"},
+    "recorded_at": "2025-02-03T04:05:08Z",
+    "payload": {"task_id":"task/u?opaque","content":{"locator":"inputs/neutral.txt","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"additive_input":true},
+    "prev_hash": "",
+    "record_hash": "",
+    "opaque": false
+  },
+  {
+    "fact_id": "extension+opaque",
+    "task_id": "task/u?opaque",
+    "kind": "opaque.recorded",
+    "actor": {"type": "service", "id": "legacy-extension"},
+    "recorded_at": "2025-02-03T04:05:09Z",
+    "payload": {"task_id":"task/u?opaque","note":"preserve","additive_extension":{"v":1}},
+    "prev_hash": "",
+    "record_hash": "",
+    "opaque": true,
+    "opaque_reason": "legacy_extension"
+  }
+]
