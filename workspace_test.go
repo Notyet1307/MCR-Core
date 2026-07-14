@@ -361,6 +361,39 @@ func TestGovernanceDeliveryAndOpaqueRoundTrip(t *testing.T) {
 	}
 }
 
+func TestOpaqueFactPreservesArbitraryJSONNumber(t *testing.T) {
+	workspace, err := mcr.Create(t.TempDir(), "workspace-opaque-number")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := workspace.Submit(validTaskSubmission("task-1")); err != nil {
+		t.Fatal(err)
+	}
+	payload := json.RawMessage(`{"kind":"adapter.number","data":{"n":1e1000}}`)
+	fact, err := workspace.Submit(mcr.Submission{
+		TaskID: "task-1", Actor: mcr.Actor{Type: "integration", ID: "test-host"},
+		Kind: mcr.KindOpaqueRecorded, Payload: payload,
+	})
+	if err != nil {
+		t.Fatalf("Submit arbitrary JSON number: %v", err)
+	}
+	if !bytes.Equal(fact.Payload, payload) {
+		t.Fatalf("submitted payload = %s, want %s", fact.Payload, payload)
+	}
+	facts, err := workspace.Query(mcr.FactQuery{FactID: fact.FactID})
+	if err != nil || len(facts) != 1 || !bytes.Equal(facts[0].Payload, payload) {
+		t.Fatalf("Query arbitrary JSON number = %#v, %v", facts, err)
+	}
+	projection, err := workspace.Replay()
+	if err != nil {
+		t.Fatal(err)
+	}
+	opaque := projection.Tasks[0].OpaqueFacts[0]
+	if opaque.SourceFactID != fact.FactID || opaque.Kind != "adapter.number" || !bytes.Equal(opaque.Data, json.RawMessage(`{"n":1e1000}`)) {
+		t.Fatalf("Replay arbitrary JSON number = %#v", opaque)
+	}
+}
+
 func TestGovernanceDeliveryAndOpaqueRejectionsLeaveLedgerUnchanged(t *testing.T) {
 	otherDigest := "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
 	tests := []struct {
@@ -1084,6 +1117,10 @@ func TestCLIContracts(t *testing.T) {
 	artifact := submitKind(`{"task_id":"task-cli","actor":{"type":"integration","id":"cli-test"},"kind":"artifact.recorded","payload":{"content":{"locator":"urn:example:cli-artifact","sha256":"`+digest+`"}}}`, mcr.KindArtifactRecorded)
 	_ = submitKind(`{"task_id":"task-cli","actor":{"type":"integration","id":"cli-test"},"kind":"delivery.recorded","payload":{"artifacts":[{"fact_id":"`+artifact.FactID+`","record_hash":"`+artifact.RecordHash+`"}],"format":"application/zip","scope":"release","target":"urn:example:target"}}`, mcr.KindDeliveryRecorded)
 	_ = submitKind(`{"task_id":"task-cli","actor":{"type":"integration","id":"cli-test"},"kind":"opaque.recorded","payload":{"kind":"adapter.runtime_observation","data":{"session":"external"}}}`, mcr.KindOpaqueRecorded)
+	largeNumber := submitKind(`{"task_id":"task-cli","actor":{"type":"integration","id":"cli-test"},"kind":"opaque.recorded","payload":{"kind":"adapter.number","data":{"n":1e1000}}}`, mcr.KindOpaqueRecorded)
+	if !bytes.Contains(largeNumber.Payload, []byte(`"n":1e1000`)) {
+		t.Fatalf("CLI changed arbitrary JSON number: %s", largeNumber.Payload)
+	}
 
 	duplicate := `{"task_id":"task-shadow","task_id":"task-duplicate","actor":{"type":"integration","id":"cli-test"},"kind":"task.created","payload":{"definition":{"namespace":"example.test","id":"duplicate","version":"v1","locator":"urn:example:duplicate:v1","sha256":"` + digest + `"}}}`
 	duplicateOut, duplicateErr, duplicateExit := runCLI(bin, duplicate, "submit", "--workspace", root)

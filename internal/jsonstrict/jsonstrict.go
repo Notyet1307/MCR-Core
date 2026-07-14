@@ -10,6 +10,7 @@ import (
 // Validate rejects duplicate object keys and trailing JSON values at any depth.
 func Validate(raw []byte) error {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
 	var walk func() error
 	walk = func() error {
 		token, err := decoder.Token()
