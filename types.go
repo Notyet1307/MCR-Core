@@ -3,6 +3,7 @@ package mcr
 import (
 	"encoding/json"
 	"errors"
+	"os"
 	"time"
 )
 
@@ -36,7 +37,9 @@ var (
 )
 
 type Workspace struct {
-	path string
+	path            string
+	rootIdentity    os.FileInfo
+	storageIdentity os.FileInfo
 }
 
 type Actor struct {
