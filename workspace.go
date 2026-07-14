@@ -520,12 +520,19 @@ func (w *Workspace) readHistory(sink factSink) (history, Verification, error) {
 	if err != nil {
 		return history{}, Verification{}, fmt.Errorf("read workspace ledger: %w", err)
 	}
-	var h history
-	var verification Verification
-	if format == "legacy" {
-		h, verification, err = parseLegacy(ledger, sink)
-	} else {
-		h, verification, err = parseNative(ledger, sink)
+	parse := func(sink factSink) (history, Verification, error) {
+		if format == formatLegacy {
+			return parseLegacy(ledger, sink)
+		}
+		return parseNative(ledger, sink)
+	}
+	parseSink := sink
+	if sink != nil {
+		parseSink = nil
+	}
+	h, verification, err := parse(parseSink)
+	if err == nil && sink != nil && acceptedHistory(verification) {
+		h, verification, err = parse(sink)
 	}
 	if err != nil {
 		return history{}, Verification{}, fmt.Errorf("read workspace ledger: %w", err)

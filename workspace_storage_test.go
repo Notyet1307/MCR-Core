@@ -3,6 +3,8 @@ package mcr_test
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -395,6 +397,16 @@ func TestVerifyAndFilteredQueryDoNotRetainUnmatchedPayloads(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, ".mcr", "events.jsonl"), ledger, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	streamFacts[len(streamFacts)-1].RecordHash = nativeWrongHash
+	invalidNativeLedger := encodeNativeLedger(t, header, streamFacts)
+	invalidNativeRoot := t.TempDir()
+	if err := os.Mkdir(filepath.Join(invalidNativeRoot, ".mcr"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(invalidNativeRoot, ".mcr", "events.jsonl"), invalidNativeLedger, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	invalidNativeLedger = nil
 	largeValue, payload, ledger, streamFacts = "", nil, nil, nil
 
 	const maxResidentSetGrowth = 20 * 1024 * 1024
@@ -442,6 +454,18 @@ func TestVerifyAndFilteredQueryDoNotRetainUnmatchedPayloads(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(legacyRoot, ".mcr", "events.jsonl"), legacyLedger.Bytes(), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	sealedLegacy := sealLegacyStreamingLedger(t, legacyLedger.Bytes())
+	invalidLegacyLedger := mutateLegacyRecord(t, sealedLegacy, 26, func(values map[string]any) {
+		values["event_hash"] = nativeWrongHash
+	})
+	invalidLegacyRoot := t.TempDir()
+	if err := os.Mkdir(filepath.Join(invalidLegacyRoot, ".mcr"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(invalidLegacyRoot, ".mcr", "events.jsonl"), invalidLegacyLedger, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sealedLegacy, invalidLegacyLedger = nil, nil
 	largeValue = ""
 	legacyLedger = bytes.Buffer{}
 	legacyVerifyGrowth := workspaceResidentSetGrowth(t, legacyRoot, "verify", "")
@@ -449,6 +473,21 @@ func TestVerifyAndFilteredQueryDoNotRetainUnmatchedPayloads(t *testing.T) {
 	t.Logf("legacy resident-set growth: Verify=%d Query=%d", legacyVerifyGrowth, legacyQueryGrowth)
 	if legacyVerifyGrowth > maxResidentSetGrowth || legacyQueryGrowth > maxResidentSetGrowth {
 		t.Fatalf("legacy resident-set growth: Verify=%d Query=%d, want each <= %d", legacyVerifyGrowth, legacyQueryGrowth, maxResidentSetGrowth)
+	}
+	for _, test := range []struct {
+		name, root string
+	}{
+		{"native", invalidNativeRoot},
+		{"legacy", invalidLegacyRoot},
+	} {
+		t.Run(test.name+" invalid history", func(t *testing.T) {
+			queryGrowth := workspaceResidentSetGrowth(t, test.root, "invalid-query", "")
+			replayGrowth := workspaceResidentSetGrowth(t, test.root, "invalid-replay", "")
+			t.Logf("%s invalid resident-set growth: Query=%d Replay=%d", test.name, queryGrowth, replayGrowth)
+			if queryGrowth > maxResidentSetGrowth || replayGrowth > maxResidentSetGrowth {
+				t.Fatalf("%s invalid resident-set growth: Query=%d Replay=%d, want each <= %d", test.name, queryGrowth, replayGrowth, maxResidentSetGrowth)
+			}
+		})
 	}
 }
 
@@ -475,6 +514,20 @@ func TestWorkspaceRetainedMemoryHelper(t *testing.T) {
 		facts, err = workspace.Query(mcr.FactQuery{FactID: os.Getenv("MCR_TEST_MEMORY_FACT_ID")})
 		if err == nil && len(facts) != 1 {
 			err = fmt.Errorf("filtered Query returned %d Facts", len(facts))
+		}
+	case "invalid-query":
+		_, err = workspace.Query(mcr.FactQuery{})
+		if !errors.Is(err, mcr.ErrInvalidHistory) {
+			err = fmt.Errorf("invalid Query error = %v, want ErrInvalidHistory", err)
+		} else {
+			err = nil
+		}
+	case "invalid-replay":
+		_, err = workspace.Replay()
+		if !errors.Is(err, mcr.ErrInvalidHistory) {
+			err = fmt.Errorf("invalid Replay error = %v, want ErrInvalidHistory", err)
+		} else {
+			err = nil
 		}
 	default:
 		err = errors.New("unknown memory operation")
@@ -517,6 +570,49 @@ func workspaceResidentSetGrowth(t *testing.T, root, operation, factID string) ui
 	}
 	t.Fatalf("memory helper did not report resident-set growth:\n%s", output)
 	return 0
+}
+
+func sealLegacyStreamingLedger(t *testing.T, unsealed []byte) []byte {
+	t.Helper()
+	type event struct {
+		EventID   string          `json:"event_id"`
+		EventType string          `json:"event_type"`
+		Timestamp string          `json:"timestamp"`
+		Actor     mcr.Actor       `json:"actor"`
+		PrevHash  string          `json:"prev_hash"`
+		EventHash string          `json:"event_hash"`
+		Payload   json.RawMessage `json:"payload"`
+	}
+	lines := bytes.Split(bytes.TrimSuffix(unsealed, []byte("\n")), []byte("\n"))
+	var sealed bytes.Buffer
+	previousHash := nativeZeroHash
+	for _, line := range lines {
+		var source event
+		if err := json.Unmarshal(line, &source); err != nil {
+			t.Fatal(err)
+		}
+		core, err := json.Marshal(struct {
+			EventID   string          `json:"event_id"`
+			EventType string          `json:"event_type"`
+			Timestamp string          `json:"timestamp"`
+			Actor     mcr.Actor       `json:"actor"`
+			Payload   json.RawMessage `json:"payload"`
+		}{source.EventID, source.EventType, source.Timestamp, source.Actor, source.Payload})
+		if err != nil {
+			t.Fatal(err)
+		}
+		digest := sha256.Sum256(append(append(core, '\n'), []byte(previousHash)...))
+		source.PrevHash = previousHash
+		source.EventHash = "sha256:" + hex.EncodeToString(digest[:])
+		encoded, err := json.Marshal(source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sealed.Write(encoded)
+		sealed.WriteByte('\n')
+		previousHash = source.EventHash
+	}
+	return sealed.Bytes()
 }
 
 func TestLegacyStorageFreshnessLargeRecordAndNoReplace(t *testing.T) {
