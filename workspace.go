@@ -16,6 +16,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf16"
 	"unicode/utf8"
 
 	"github.com/Notyet1307/MCR-Core/internal/jsonstrict"
@@ -27,6 +28,11 @@ var nativeHash = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
 var beforeLedgerReplace = func() error { return nil }
 var errNotRegular = errors.New("not regular")
+var errCacheNotObject = errors.New("cache not object")
+var errCacheInvalidJSON = errors.New("cache invalid JSON")
+
+const maxLegacyCacheDepth = 10000
+
 var afterWorkspaceLock = func() error { return nil }
 var beforeWorkspaceIO = func() error { return nil }
 var beforeRootRegularOpen = func(string) error { return nil }
@@ -570,40 +576,652 @@ func inspectLegacyCache(storage *os.Root, h history, verification Verification) 
 		}
 		return []Diagnostic{{Code: "legacy_cache_unreadable", Message: "legacy state cache cannot be inspected"}}
 	}
-	data, readErr := io.ReadAll(cache)
+	fields, readErr := readLegacyCacheFields(cache, h.header.WorkspaceID, verification.LastRecordID)
 	closeErr := cache.Close()
-	if readErr != nil || closeErr != nil {
+	if closeErr != nil {
 		return []Diagnostic{{Code: "legacy_cache_unreadable", Message: "legacy state cache cannot be read"}}
 	}
-	if err := jsonstrict.Validate(data); err != nil {
-		return []Diagnostic{{Code: "legacy_cache_invalid_json", Message: "legacy state cache is not strict JSON"}}
-	}
-	fields, err := decodeOrderedObject(data)
-	if err != nil {
-		return []Diagnostic{{Code: "legacy_cache_not_object", Message: "legacy state cache must be a JSON object"}}
-	}
-	values := make(map[string]json.RawMessage, len(fields))
-	for _, field := range fields {
-		values[field.name] = field.raw
+	if readErr != nil {
+		if errors.Is(readErr, errCacheInvalidJSON) {
+			return []Diagnostic{{Code: "legacy_cache_invalid_json", Message: "legacy state cache is not strict JSON"}}
+		}
+		if errors.Is(readErr, errCacheNotObject) {
+			return []Diagnostic{{Code: "legacy_cache_not_object", Message: "legacy state cache must be a JSON object"}}
+		}
+		return []Diagnostic{{Code: "legacy_cache_unreadable", Message: "legacy state cache cannot be read"}}
 	}
 	diagnostics := make([]Diagnostic, 0, 2)
-	if raw, ok := values["workspace_id"]; ok {
-		var workspaceID string
-		if json.Unmarshal(raw, &workspaceID) != nil {
-			diagnostics = append(diagnostics, Diagnostic{Code: "legacy_cache_invalid_workspace", Message: "legacy state cache workspace_id must be a string"})
-		} else if h.header.WorkspaceID != "" && workspaceID != h.header.WorkspaceID {
-			diagnostics = append(diagnostics, Diagnostic{Code: "legacy_cache_workspace_mismatch", Message: "legacy state cache workspace_id does not match Events"})
-		}
+	if fields.invalidWorkspaceID {
+		diagnostics = append(diagnostics, Diagnostic{Code: "legacy_cache_invalid_workspace", Message: "legacy state cache workspace_id must be a string"})
+	} else if fields.workspaceIDPresent && !fields.workspaceIDMatches {
+		diagnostics = append(diagnostics, Diagnostic{Code: "legacy_cache_workspace_mismatch", Message: "legacy state cache workspace_id does not match Events"})
 	}
-	if raw, ok := values["last_event_id"]; ok {
-		var lastEventID string
-		if json.Unmarshal(raw, &lastEventID) != nil {
-			diagnostics = append(diagnostics, Diagnostic{Code: "legacy_cache_invalid_last_event", Message: "legacy state cache last_event_id must be a string"})
-		} else if verification.LastRecordID != "" && lastEventID != verification.LastRecordID {
-			diagnostics = append(diagnostics, Diagnostic{Code: "legacy_cache_last_event_stale", Message: "legacy state cache last_event_id does not match Events"})
-		}
+	if fields.invalidLastEventID {
+		diagnostics = append(diagnostics, Diagnostic{Code: "legacy_cache_invalid_last_event", Message: "legacy state cache last_event_id must be a string"})
+	} else if fields.lastEventIDPresent && !fields.lastEventIDMatches {
+		diagnostics = append(diagnostics, Diagnostic{Code: "legacy_cache_last_event_stale", Message: "legacy state cache last_event_id does not match Events"})
 	}
 	return diagnostics
+}
+
+type legacyCacheFields struct {
+	workspaceIDPresent bool
+	workspaceIDMatches bool
+	lastEventIDPresent bool
+	lastEventIDMatches bool
+	invalidWorkspaceID bool
+	invalidLastEventID bool
+}
+
+func readLegacyCacheFields(cache io.ReadSeeker, workspaceID, lastEventID string) (legacyCacheFields, error) {
+	if _, err := cache.Seek(0, io.SeekStart); err != nil {
+		return legacyCacheFields{}, err
+	}
+	reader := bufio.NewReader(cache)
+	first, err := readJSONNonSpace(reader)
+	if err != nil {
+		return legacyCacheFields{}, cacheParseError(err)
+	}
+	if first != '{' {
+		if err := checkJSONDuplicates(reader, first, 0); err != nil {
+			return legacyCacheFields{}, cacheParseError(err)
+		}
+		if _, err := readJSONNonSpace(reader); !errors.Is(err, io.EOF) {
+			if err != nil {
+				return legacyCacheFields{}, err
+			}
+			return legacyCacheFields{}, errCacheInvalidJSON
+		}
+		return legacyCacheFields{}, errCacheNotObject
+	}
+	fields, err := readLegacyCacheObject(reader, workspaceID, lastEventID)
+	if err != nil {
+		return legacyCacheFields{}, cacheParseError(err)
+	}
+	if _, err := readJSONNonSpace(reader); !errors.Is(err, io.EOF) {
+		if err != nil {
+			return legacyCacheFields{}, err
+		}
+		return legacyCacheFields{}, errCacheInvalidJSON
+	}
+	return fields, nil
+}
+
+func cacheParseError(err error) error {
+	if errors.Is(err, io.EOF) || errors.Is(err, errCacheInvalidJSON) {
+		return errCacheInvalidJSON
+	}
+	return err
+}
+
+func readLegacyCacheObject(reader *bufio.Reader, workspaceID, lastEventID string) (legacyCacheFields, error) {
+	var fields legacyCacheFields
+	seen := make(map[jsonKeyFingerprint]bool)
+	next, err := readJSONNonSpace(reader)
+	if err != nil {
+		return fields, err
+	}
+	if next == '}' {
+		return fields, nil
+	}
+	for {
+		if next != '"' {
+			return fields, errCacheInvalidJSON
+		}
+		fingerprint, key, err := readJSONKey(reader)
+		if err != nil {
+			return fields, err
+		}
+		if seen[fingerprint] {
+			return fields, errCacheInvalidJSON
+		}
+		seen[fingerprint] = true
+		next, err = readJSONNonSpace(reader)
+		if err != nil {
+			return fields, err
+		}
+		if next != ':' {
+			return fields, errCacheInvalidJSON
+		}
+		next, err = readJSONNonSpace(reader)
+		if err != nil {
+			return fields, err
+		}
+		if key == "workspace_id" || key == "last_event_id" {
+			expected := workspaceID
+			if key == "last_event_id" {
+				expected = lastEventID
+			}
+			invalidType := next != '"'
+			nullValue := false
+			matches := false
+			if invalidType {
+				nullValue, err = checkJSONNull(reader, next)
+				if !nullValue && err == nil {
+					err = checkJSONDuplicates(reader, next, 1)
+				}
+				matches = nullValue && expected == ""
+			} else {
+				matches, err = readJSONStringMatches(reader, expected)
+			}
+			if err != nil {
+				return fields, err
+			}
+			if key == "workspace_id" {
+				fields.workspaceIDPresent = true
+				fields.workspaceIDMatches = matches
+				fields.invalidWorkspaceID = invalidType && !nullValue
+			} else {
+				fields.lastEventIDPresent = true
+				fields.lastEventIDMatches = matches
+				fields.invalidLastEventID = invalidType && !nullValue
+			}
+		} else if err := checkJSONDuplicates(reader, next, 1); err != nil {
+			return fields, err
+		}
+		next, err = readJSONNonSpace(reader)
+		if err != nil {
+			return fields, err
+		}
+		if next == '}' {
+			return fields, nil
+		}
+		if next != ',' {
+			return fields, errCacheInvalidJSON
+		}
+		next, err = readJSONNonSpace(reader)
+		if err != nil {
+			return fields, err
+		}
+	}
+}
+
+func checkJSONDuplicates(reader *bufio.Reader, first byte, depth int) error {
+	if depth > maxLegacyCacheDepth {
+		return errCacheInvalidJSON
+	}
+	switch first {
+	case '{':
+		seen := make(map[jsonKeyFingerprint]bool)
+		next, err := readJSONNonSpace(reader)
+		if err != nil {
+			return err
+		}
+		if next == '}' {
+			return nil
+		}
+		for {
+			if next != '"' {
+				return errCacheInvalidJSON
+			}
+			fingerprint, _, err := readJSONKey(reader)
+			if err != nil {
+				return err
+			}
+			if seen[fingerprint] {
+				return errCacheInvalidJSON
+			}
+			seen[fingerprint] = true
+			next, err = readJSONNonSpace(reader)
+			if err != nil {
+				return err
+			}
+			if next != ':' {
+				return errCacheInvalidJSON
+			}
+			next, err = readJSONNonSpace(reader)
+			if err != nil {
+				return err
+			}
+			if err := checkJSONDuplicates(reader, next, depth+1); err != nil {
+				return err
+			}
+			next, err = readJSONNonSpace(reader)
+			if err != nil {
+				return err
+			}
+			if next == '}' {
+				return nil
+			}
+			if next != ',' {
+				return errCacheInvalidJSON
+			}
+			next, err = readJSONNonSpace(reader)
+			if err != nil {
+				return err
+			}
+		}
+	case '[':
+		next, err := readJSONNonSpace(reader)
+		if err != nil {
+			return err
+		}
+		if next == ']' {
+			return nil
+		}
+		for {
+			if err := checkJSONDuplicates(reader, next, depth+1); err != nil {
+				return err
+			}
+			next, err = readJSONNonSpace(reader)
+			if err != nil {
+				return err
+			}
+			if next == ']' {
+				return nil
+			}
+			if next != ',' {
+				return errCacheInvalidJSON
+			}
+			next, err = readJSONNonSpace(reader)
+			if err != nil {
+				return err
+			}
+		}
+	case '"':
+		_, err := readJSONStringBytes(reader, false)
+		return err
+	default:
+		return checkJSONScalar(reader, first)
+	}
+}
+
+type jsonKeyFingerprint struct {
+	digest [sha256.Size]byte
+	length uint64
+}
+
+func readJSONKey(reader *bufio.Reader) (jsonKeyFingerprint, string, error) {
+	hasher := sha256.New()
+	length := uint64(0)
+	name := make([]byte, 0, len("last_event_id"))
+	tooLong := false
+	err := scanJSONString(reader, func(decoded []byte) {
+		_, _ = hasher.Write(decoded)
+		length += uint64(len(decoded))
+		if !tooLong && len(name)+len(decoded) <= cap(name) {
+			name = append(name, decoded...)
+		} else {
+			tooLong = true
+			name = name[:0]
+		}
+	})
+	if err != nil {
+		return jsonKeyFingerprint{}, "", err
+	}
+	var digest [sha256.Size]byte
+	copy(digest[:], hasher.Sum(nil))
+	text := string(name)
+	if tooLong || text != "workspace_id" && text != "last_event_id" {
+		text = ""
+	}
+	return jsonKeyFingerprint{digest: digest, length: length}, text, nil
+}
+
+func readJSONStringBytes(reader *bufio.Reader, capture bool) ([]byte, error) {
+	var raw []byte
+	if capture {
+		raw = []byte{'"'}
+	}
+	for {
+		value, err := reader.ReadByte()
+		if err != nil {
+			return nil, err
+		}
+		if capture {
+			raw = append(raw, value)
+		}
+		switch {
+		case value == '"':
+			return raw, nil
+		case value < 0x20:
+			return nil, errCacheInvalidJSON
+		case value == '\\':
+			escape, err := reader.ReadByte()
+			if err != nil {
+				return nil, err
+			}
+			if capture {
+				raw = append(raw, escape)
+			}
+			switch escape {
+			case '"', '\\', '/', 'b', 'f', 'n', 'r', 't':
+			case 'u':
+				for range 4 {
+					digit, err := reader.ReadByte()
+					if err != nil {
+						return nil, err
+					}
+					if !isJSONHex(digit) {
+						return nil, errCacheInvalidJSON
+					}
+					if capture {
+						raw = append(raw, digit)
+					}
+				}
+			default:
+				return nil, errCacheInvalidJSON
+			}
+		case value >= utf8.RuneSelf:
+			runeBytes := []byte{value}
+			for !utf8.FullRune(runeBytes) {
+				next, err := reader.ReadByte()
+				if err != nil {
+					return nil, err
+				}
+				runeBytes = append(runeBytes, next)
+				if capture {
+					raw = append(raw, next)
+				}
+			}
+			if decoded, size := utf8.DecodeRune(runeBytes); decoded == utf8.RuneError && size == 1 {
+				return nil, errCacheInvalidJSON
+			}
+		}
+	}
+}
+
+func isJSONHex(value byte) bool {
+	return value >= '0' && value <= '9' || value >= 'a' && value <= 'f' || value >= 'A' && value <= 'F'
+}
+
+func readJSONStringMatches(reader *bufio.Reader, expected string) (bool, error) {
+	position := 0
+	matches := true
+	emit := func(decoded []byte) {
+		if position > len(expected) || position+len(decoded) > len(expected) || !bytes.Equal(decoded, []byte(expected[position:position+len(decoded)])) {
+			matches = false
+		}
+		position += len(decoded)
+	}
+	if err := scanJSONString(reader, emit); err != nil {
+		return false, err
+	}
+	return matches && position == len(expected), nil
+}
+
+func scanJSONString(reader *bufio.Reader, emit func([]byte)) error {
+	for {
+		value, err := reader.ReadByte()
+		if err != nil {
+			return err
+		}
+		switch {
+		case value == '"':
+			return nil
+		case value < 0x20:
+			return errCacheInvalidJSON
+		case value == '\\':
+			escape, err := reader.ReadByte()
+			if err != nil {
+				return err
+			}
+			switch escape {
+			case '"', '\\', '/':
+				emit([]byte{escape})
+			case 'b':
+				emit([]byte{'\b'})
+			case 'f':
+				emit([]byte{'\f'})
+			case 'n':
+				emit([]byte{'\n'})
+			case 'r':
+				emit([]byte{'\r'})
+			case 't':
+				emit([]byte{'\t'})
+			case 'u':
+				code, err := readJSONCodeUnit(reader)
+				if err != nil {
+					return err
+				}
+				if code >= 0xd800 && code <= 0xdbff {
+					low, paired, err := peekJSONLowSurrogate(reader)
+					if err != nil {
+						return err
+					}
+					if paired {
+						_, _ = reader.Discard(6)
+						emit(utf8.AppendRune(nil, utf16.DecodeRune(rune(code), rune(low))))
+						continue
+					}
+				}
+				emitJSONCodeUnit(emit, code)
+			default:
+				return errCacheInvalidJSON
+			}
+		case value < utf8.RuneSelf:
+			emit([]byte{value})
+		default:
+			runeBytes := []byte{value}
+			for !utf8.FullRune(runeBytes) {
+				next, err := reader.ReadByte()
+				if err != nil {
+					return err
+				}
+				runeBytes = append(runeBytes, next)
+			}
+			decoded, size := utf8.DecodeRune(runeBytes)
+			if decoded == utf8.RuneError && size == 1 {
+				return errCacheInvalidJSON
+			}
+			emit(runeBytes)
+		}
+	}
+}
+
+func peekJSONLowSurrogate(reader *bufio.Reader) (uint16, bool, error) {
+	encoded, err := reader.Peek(6)
+	if errors.Is(err, io.EOF) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	if !bytes.Equal(encoded[:2], []byte(`\u`)) {
+		return 0, false, nil
+	}
+	var value uint16
+	for _, digit := range encoded[2:] {
+		value <<= 4
+		switch {
+		case digit >= '0' && digit <= '9':
+			value |= uint16(digit - '0')
+		case digit >= 'a' && digit <= 'f':
+			value |= uint16(digit-'a') + 10
+		case digit >= 'A' && digit <= 'F':
+			value |= uint16(digit-'A') + 10
+		default:
+			return 0, false, nil
+		}
+	}
+	return value, value >= 0xdc00 && value <= 0xdfff, nil
+}
+
+func readJSONCodeUnit(reader *bufio.Reader) (uint16, error) {
+	var value uint16
+	for range 4 {
+		digit, err := reader.ReadByte()
+		if err != nil {
+			return 0, err
+		}
+		value <<= 4
+		switch {
+		case digit >= '0' && digit <= '9':
+			value |= uint16(digit - '0')
+		case digit >= 'a' && digit <= 'f':
+			value |= uint16(digit-'a') + 10
+		case digit >= 'A' && digit <= 'F':
+			value |= uint16(digit-'A') + 10
+		default:
+			return 0, errCacheInvalidJSON
+		}
+	}
+	return value, nil
+}
+
+func emitJSONCodeUnit(emit func([]byte), code uint16) {
+	if code >= 0xd800 && code <= 0xdfff {
+		emit(utf8.AppendRune(nil, utf8.RuneError))
+		return
+	}
+	emit(utf8.AppendRune(nil, rune(code)))
+}
+
+func checkJSONNull(reader *bufio.Reader, first byte) (bool, error) {
+	if first != 'n' {
+		return false, nil
+	}
+	if err := readJSONLiteral(reader, "ull"); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func checkJSONScalar(reader *bufio.Reader, first byte) error {
+	switch first {
+	case 't':
+		return readJSONLiteral(reader, "rue")
+	case 'f':
+		return readJSONLiteral(reader, "alse")
+	case 'n':
+		return readJSONLiteral(reader, "ull")
+	case '-':
+		next, err := readJSONByte(reader)
+		if err != nil {
+			return err
+		}
+		if next < '0' || next > '9' {
+			return errCacheInvalidJSON
+		}
+		first = next
+	}
+	if first < '0' || first > '9' {
+		return errCacheInvalidJSON
+	}
+	if first == '0' {
+		next, ok, err := peekJSONByte(reader)
+		if err != nil {
+			return err
+		}
+		if ok && next >= '0' && next <= '9' {
+			return errCacheInvalidJSON
+		}
+	} else if err := consumeJSONDigits(reader); err != nil {
+		return err
+	}
+	next, ok, err := peekJSONByte(reader)
+	if err != nil {
+		return err
+	}
+	if ok && next == '.' {
+		_, _ = reader.ReadByte()
+		next, err := readJSONByte(reader)
+		if err != nil {
+			return err
+		}
+		if next < '0' || next > '9' {
+			return errCacheInvalidJSON
+		}
+		if err := consumeJSONDigits(reader); err != nil {
+			return err
+		}
+	}
+	next, ok, err = peekJSONByte(reader)
+	if err != nil {
+		return err
+	}
+	if ok && (next == 'e' || next == 'E') {
+		_, _ = reader.ReadByte()
+		sign, signOK, err := peekJSONByte(reader)
+		if err != nil {
+			return err
+		}
+		if signOK && (sign == '+' || sign == '-') {
+			_, _ = reader.ReadByte()
+		}
+		next, err := readJSONByte(reader)
+		if err != nil {
+			return err
+		}
+		if next < '0' || next > '9' {
+			return errCacheInvalidJSON
+		}
+		if err := consumeJSONDigits(reader); err != nil {
+			return err
+		}
+	}
+	return requireJSONDelimiter(reader)
+}
+
+func consumeJSONDigits(reader *bufio.Reader) error {
+	for {
+		next, ok, err := peekJSONByte(reader)
+		if err != nil {
+			return err
+		}
+		if !ok || next < '0' || next > '9' {
+			return nil
+		}
+		_, _ = reader.ReadByte()
+	}
+}
+
+func readJSONLiteral(reader *bufio.Reader, rest string) error {
+	for index := range len(rest) {
+		value, err := reader.ReadByte()
+		if err != nil {
+			return err
+		}
+		if value != rest[index] {
+			return errCacheInvalidJSON
+		}
+	}
+	return requireJSONDelimiter(reader)
+}
+
+func requireJSONDelimiter(reader *bufio.Reader) error {
+	value, ok, err := peekJSONByte(reader)
+	if err != nil {
+		return err
+	}
+	if !ok || value == ' ' || value == '\t' || value == '\r' || value == '\n' || value == ',' || value == '}' || value == ']' {
+		return nil
+	}
+	return errCacheInvalidJSON
+}
+
+func readJSONByte(reader *bufio.Reader) (byte, error) {
+	value, err := reader.ReadByte()
+	if err != nil {
+		return 0, err
+	}
+	return value, nil
+}
+
+func peekJSONByte(reader *bufio.Reader) (byte, bool, error) {
+	value, err := reader.Peek(1)
+	if errors.Is(err, io.EOF) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return value[0], true, nil
+}
+
+func readJSONNonSpace(reader *bufio.Reader) (byte, error) {
+	for {
+		value, err := reader.ReadByte()
+		if err != nil {
+			return 0, err
+		}
+		switch value {
+		case ' ', '\t', '\r', '\n':
+			continue
+		default:
+			return value, nil
+		}
+	}
 }
 
 func parseNative(ledger io.ReadSeeker, sink factSink) (history, Verification, error) {

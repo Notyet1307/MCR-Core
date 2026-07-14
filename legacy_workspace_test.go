@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -770,6 +771,39 @@ func TestLegacyContentCompleteInvalidDigestFailsClosed(t *testing.T) {
 	}
 }
 
+func TestLegacyTaskDefinitionAdditionsRemainTyped(t *testing.T) {
+	unsealed, err := os.ReadFile("testdata/legacy/unsealed-valid.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutated := mutateLegacyRecord(t, unsealed, 2, func(values map[string]any) {
+		payload := values["payload"].(map[string]any)
+		definition := payload["definition"].(map[string]any)
+		definition["future_definition"] = map[string]any{"retained": true}
+	})
+	workspacePath := writeLegacyWorkspace(t, mutated, []byte("{}\n"))
+	before := snapshotFiles(t, workspacePath)
+	workspace, err := mcr.Open(workspacePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verification, err := workspace.Verify()
+	if err != nil || !verification.StructuralValid || verification.Integrity != mcr.IntegrityUnsealed {
+		t.Fatalf("Verify additive Definition = %#v, %v", verification, err)
+	}
+	facts, err := workspace.Query(mcr.FactQuery{FactID: "task@u-9"})
+	if err != nil || len(facts) != 1 || facts[0].Kind != mcr.KindTaskCreated || !bytes.Contains(facts[0].Payload, []byte(`"future_definition":{"retained":true}`)) {
+		t.Fatalf("Query additive Definition = %#v, %v", facts, err)
+	}
+	projection, err := workspace.Replay()
+	if err != nil || len(projection.Tasks) != 1 || projection.Tasks[0].Definition.ID != "unsealed-task" {
+		t.Fatalf("Replay additive Definition = %#v, %v", projection, err)
+	}
+	if after := snapshotFiles(t, workspacePath); !reflect.DeepEqual(after, before) {
+		t.Fatal("legacy files changed")
+	}
+}
+
 func TestLegacyTaskAndRunUnderboundRemainOpaque(t *testing.T) {
 	unsealed, err := os.ReadFile("testdata/legacy/unsealed-valid.jsonl")
 	if err != nil {
@@ -981,6 +1015,17 @@ func TestLegacyCacheDiagnosticsAreNonAuthoritative(t *testing.T) {
 		{name: "malformed", state: []byte("{\n"), code: "legacy_cache_invalid_json"},
 		{name: "non-object", state: []byte("[]\n"), code: "legacy_cache_not_object"},
 		{name: "mismatch", state: []byte("{\"workspace_id\":\"other\",\"last_event_id\":\"stale\"}\n"), code: "legacy_cache_workspace_mismatch"},
+		{name: "nested duplicate", state: []byte(`{"nested":{"x":1,"x":2}}`), code: "legacy_cache_invalid_json"},
+		{name: "trailing value", state: []byte(`{} []`), code: "legacy_cache_invalid_json"},
+		{name: "invalid number", state: []byte(`{"nested":01}`), code: "legacy_cache_invalid_json"},
+		{name: "invalid escape", state: []byte(`{"nested":"\q"}`), code: "legacy_cache_invalid_json"},
+		{name: "workspace wrong type", state: []byte(`{"workspace_id":123}`), code: "legacy_cache_invalid_workspace"},
+		{name: "last event wrong type", state: []byte(`{"last_event_id":[]}`), code: "legacy_cache_invalid_last_event"},
+		{name: "workspace null", state: []byte(`{"workspace_id":null}`), code: "legacy_cache_workspace_mismatch"},
+		{name: "last event null", state: []byte(`{"last_event_id":null}`), code: "legacy_cache_last_event_stale"},
+		{name: "workspace empty", state: []byte(`{"workspace_id":""}`), code: "legacy_cache_workspace_mismatch"},
+		{name: "last event empty", state: []byte(`{"last_event_id":""}`), code: "legacy_cache_last_event_stale"},
+		{name: "excessive nesting", state: []byte(`{"nested":` + strings.Repeat("[", 10001) + `0` + strings.Repeat("]", 10001) + `}`), code: "legacy_cache_invalid_json"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -999,6 +1044,45 @@ func TestLegacyCacheDiagnosticsAreNonAuthoritative(t *testing.T) {
 			}
 		})
 	}
+	for _, test := range []struct {
+		name  string
+		state []byte
+	}{
+		{name: "escaped identities", state: []byte(`{"workspace_id":"workspace\u002funsealed","last_event_id":"extension\u002bopaque"}`)},
+		{name: "supported nesting", state: []byte(`{"nested":` + strings.Repeat("[", 1002) + `0` + strings.Repeat("]", 1002) + `}`)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			workspacePath := writeLegacyWorkspace(t, ledger, test.state)
+			workspace, err := mcr.Open(workspacePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			verification, err := workspace.Verify()
+			if err != nil || len(verification.Diagnostics) != 0 {
+				t.Fatalf("Verify accepted cache = %#v, %v", verification, err)
+			}
+		})
+	}
+	t.Run("long matching workspace identity", func(t *testing.T) {
+		workspaceID := strings.Repeat("i", 5000)
+		mutated := mutateLegacyRecord(t, ledger, 1, func(values map[string]any) {
+			payload := values["payload"].(map[string]any)
+			payload["workspace_id"] = workspaceID
+		})
+		state, err := json.Marshal(map[string]any{"workspace_id": workspaceID, "last_event_id": "extension+opaque"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		workspacePath := writeLegacyWorkspace(t, mutated, state)
+		workspace, err := mcr.Open(workspacePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		verification, err := workspace.Verify()
+		if err != nil || len(verification.Diagnostics) != 0 {
+			t.Fatalf("Verify long matching identity = %#v, %v", verification, err)
+		}
+	})
 	for _, name := range []string{"symlink", "directory", "fifo"} {
 		t.Run(name, func(t *testing.T) {
 			workspace := writeLegacyWorkspace(t, ledger, nil)

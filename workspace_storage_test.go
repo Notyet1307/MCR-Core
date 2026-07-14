@@ -474,6 +474,21 @@ func TestVerifyAndFilteredQueryDoNotRetainUnmatchedPayloads(t *testing.T) {
 	if legacyVerifyGrowth > maxResidentSetGrowth || legacyQueryGrowth > maxResidentSetGrowth {
 		t.Fatalf("legacy resident-set growth: Verify=%d Query=%d, want each <= %d", legacyVerifyGrowth, legacyQueryGrowth, maxResidentSetGrowth)
 	}
+	cacheLedger, err := os.ReadFile("testdata/legacy/unsealed-valid.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	largeIdentity := strings.Repeat("i", 24*1024*1024)
+	largeCache := []byte(`{"workspace_id":"` + largeIdentity + `","` + largeIdentity + `":0}`)
+	cacheRoot := writeLegacyWorkspace(t, cacheLedger, largeCache)
+	largeCache = nil
+	cacheVerifyGrowth := workspaceResidentSetGrowth(t, cacheRoot, "verify", "")
+	largeIdentity = ""
+	cacheQueryGrowth := workspaceResidentSetGrowth(t, cacheRoot, "query", "extension+opaque")
+	t.Logf("legacy cache resident-set growth: Verify=%d Query=%d", cacheVerifyGrowth, cacheQueryGrowth)
+	if cacheVerifyGrowth > maxResidentSetGrowth || cacheQueryGrowth > maxResidentSetGrowth {
+		t.Fatalf("legacy cache resident-set growth: Verify=%d Query=%d, want each <= %d", cacheVerifyGrowth, cacheQueryGrowth, maxResidentSetGrowth)
+	}
 	for _, test := range []struct {
 		name, root string
 	}{

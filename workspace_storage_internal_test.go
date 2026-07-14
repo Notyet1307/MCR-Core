@@ -6,7 +6,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestSubmitFailureBeforeReplacePreservesLedger(t *testing.T) {
@@ -315,5 +317,52 @@ func TestRootEntryErrorPreservesOSCause(t *testing.T) {
 	err := rootEntryError("events.jsonl", os.ErrPermission)
 	if !errors.Is(err, os.ErrPermission) || errors.Is(err, ErrConflict) {
 		t.Fatalf("permission error classification = %v", err)
+	}
+}
+
+type failingReadSeeker struct {
+	*bytes.Reader
+	remaining int
+}
+
+func (reader *failingReadSeeker) Read(buffer []byte) (int, error) {
+	if reader.remaining == 0 {
+		return 0, syscall.EIO
+	}
+	if len(buffer) > reader.remaining {
+		buffer = buffer[:reader.remaining]
+	}
+	read, err := reader.Reader.Read(buffer)
+	reader.remaining -= read
+	return read, err
+}
+
+func TestLegacyCacheReadFailureRemainsOperational(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		cache     string
+		remaining int
+	}{
+		{"container", `{"nested":[1,2,3]}`, 10},
+		{"literal", `{"nested":true}`, 12},
+		{"unicode escape", `{"nested":"\u0061"}`, 14},
+		{"number", `{"nested":1e10}`, 13},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cache := &failingReadSeeker{Reader: bytes.NewReader([]byte(test.cache)), remaining: test.remaining}
+			_, err := readLegacyCacheFields(cache, "", "")
+			if !errors.Is(err, syscall.EIO) || errors.Is(err, errCacheInvalidJSON) {
+				t.Fatalf("cache read error = %v", err)
+			}
+		})
+	}
+}
+
+func TestLegacyCacheSurrogateSequenceMatchesEncodingJSON(t *testing.T) {
+	expected := string([]rune{utf8.RuneError, 0x10000})
+	cache := bytes.NewReader([]byte(`{"last_event_id":"\uD800\uD800\uDC00"}`))
+	fields, err := readLegacyCacheFields(cache, "", expected)
+	if err != nil || !fields.lastEventIDPresent || !fields.lastEventIDMatches {
+		t.Fatalf("surrogate cache fields = %#v, %v", fields, err)
 	}
 }

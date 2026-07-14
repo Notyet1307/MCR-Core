@@ -244,10 +244,11 @@ func normalizeLegacyEvent(event legacyEvent, state nativeState) (Fact, string, j
 	case "TaskCreated":
 		sourceComplete = legacyKeysPresent(values, "task_id", "definition") && legacyObjectSourceComplete(values["definition"], "namespace", "id", "version", "locator", "sha256")
 		if sourceComplete {
+			definition := marshalSelected(legacyObject(values["definition"]), "namespace", "id", "version", "locator", "sha256")
 			kind = KindTaskCreated
 			semantic = marshalLegacySemantic(struct {
 				Definition json.RawMessage `json:"definition"`
-			}{values["definition"]})
+			}{definition})
 		}
 	case "RunCompleted":
 		sourceComplete = legacyKeysPresent(values, "task_id", "started_at", "ended_at", "outcome")
