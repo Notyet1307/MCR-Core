@@ -49,14 +49,20 @@ type factRecord struct {
 }
 
 type history struct {
-	header           workspaceHeader
-	facts            []Fact
-	format           string
-	readOnly         bool
-	semanticPayloads []json.RawMessage
-	semanticTaskIDs  []string
-	rawLines         [][]byte
+	header         workspaceHeader
+	format         string
+	readOnly       bool
+	state          nativeState
+	lastRecordHash string
 }
+
+type factTarget struct {
+	TaskID     string
+	Kind       string
+	RecordHash string
+}
+
+type factSink func(Fact, json.RawMessage)
 
 type runPayload struct {
 	StartedAt time.Time `json:"started_at"`
@@ -118,19 +124,15 @@ type opaquePayload struct {
 
 type nativeState struct {
 	tasks map[string]bool
-	facts map[string]Fact
+	facts map[string]factTarget
 }
 
-func newNativeState(facts []Fact) nativeState {
-	state := nativeState{tasks: make(map[string]bool), facts: make(map[string]Fact, len(facts))}
-	for _, fact := range facts {
-		state.add(fact)
-	}
-	return state
+func newNativeState(capacity int) nativeState {
+	return nativeState{tasks: make(map[string]bool), facts: make(map[string]factTarget, capacity)}
 }
 
 func (s *nativeState) add(fact Fact) {
-	s.facts[fact.FactID] = fact
+	s.facts[fact.FactID] = factTarget{TaskID: fact.TaskID, Kind: fact.Kind, RecordHash: fact.RecordHash}
 	if fact.Kind == KindTaskCreated {
 		s.tasks[fact.TaskID] = true
 	}
@@ -318,7 +320,7 @@ func (w *Workspace) Submit(submission Submission) (Fact, error) {
 	}
 	defer unlockDirectory(lock)
 
-	h, verification, err := w.readHistory()
+	h, verification, err := w.readHistory(nil)
 	if err != nil {
 		return zero, err
 	}
@@ -328,11 +330,11 @@ func (w *Workspace) Submit(submission Submission) (Fact, error) {
 	if h.readOnly {
 		return zero, fmt.Errorf("%w: legacy workspace", ErrReadOnly)
 	}
-	if err := validateSubmission(submission, h); err != nil {
+	if err := validateSubmission(submission, h.state); err != nil {
 		return zero, err
 	}
 
-	factID, err := newFactID(h.facts)
+	factID, err := newFactID(h.state.facts)
 	if err != nil {
 		return zero, fmt.Errorf("generate fact identity: %w", err)
 	}
@@ -340,10 +342,7 @@ func (w *Workspace) Submit(submission Submission) (Fact, error) {
 	record := factRecord{
 		RecordType: "fact", FactID: factID, TaskID: submission.TaskID, Kind: submission.Kind,
 		Actor: submission.Actor, RecordedAt: time.Now().UTC().Format(time.RFC3339Nano), Payload: payload,
-		PrevHash: h.header.RecordHash,
-	}
-	if len(h.facts) > 0 {
-		record.PrevHash = h.facts[len(h.facts)-1].RecordHash
+		PrevHash: h.lastRecordHash,
 	}
 	record.RecordHash, err = hashRecord(struct {
 		RecordType string          `json:"record_type"`
@@ -375,20 +374,19 @@ func (w *Workspace) Query(query FactQuery) ([]Fact, error) {
 	}
 	defer unlockDirectory(lock)
 
-	h, verification, err := w.readHistory()
-	if err != nil {
-		return nil, err
-	}
-	if !acceptedHistory(verification) {
-		return nil, fmt.Errorf("%w: workspace ledger is not valid", ErrInvalidHistory)
-	}
-	facts := make([]Fact, 0, len(h.facts))
-	for _, fact := range h.facts {
+	facts := make([]Fact, 0)
+	_, verification, err := w.readHistory(func(fact Fact, _ json.RawMessage) {
 		if (query.FactID == "" || fact.FactID == query.FactID) &&
 			(query.TaskID == "" || fact.TaskID == query.TaskID) &&
 			(query.Kind == "" || fact.Kind == query.Kind) {
 			facts = append(facts, fact)
 		}
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !acceptedHistory(verification) {
+		return nil, fmt.Errorf("%w: workspace ledger is not valid", ErrInvalidHistory)
 	}
 	return facts, nil
 }
@@ -400,90 +398,101 @@ func (w *Workspace) Replay() (Projection, error) {
 	}
 	defer unlockDirectory(lock)
 
-	h, verification, err := w.readHistory()
+	builder := newProjectionBuilder()
+	h, verification, err := w.readHistory(builder.add)
 	if err != nil {
 		return Projection{}, err
 	}
 	if !acceptedHistory(verification) {
 		return Projection{}, fmt.Errorf("%w: workspace ledger is not valid", ErrInvalidHistory)
 	}
-	return projectHistory(h, verification.Format, verification.Integrity), nil
+	return builder.result(h.header.WorkspaceID, verification.Format, verification.Integrity), nil
 }
 
 func acceptedHistory(verification Verification) bool {
 	return verification.StructuralValid && (verification.Integrity == IntegritySealedValid || verification.Integrity == IntegrityUnsealed)
 }
 
-func projectHistory(h history, format, integrity string) Projection {
-	projection := Projection{WorkspaceID: h.header.WorkspaceID, Format: format, Integrity: integrity, Tasks: make([]TaskProjection, 0, len(h.facts)), OpaqueFacts: []OpaqueFactProjection{}}
-	taskIndexes := make(map[string]int)
-	for index, fact := range h.facts {
-		payload := fact.Payload
-		if index < len(h.semanticPayloads) && len(h.semanticPayloads[index]) != 0 {
-			payload = h.semanticPayloads[index]
-		}
-		switch fact.Kind {
-		case KindTaskCreated:
-			definition, _ := decodeTaskPayload(payload)
-			taskIndexes[fact.TaskID] = len(projection.Tasks)
-			projection.Tasks = append(projection.Tasks, TaskProjection{
-				TaskID: fact.TaskID, SourceFactID: fact.FactID, Definition: definition,
-				Runs: []RunProjection{}, RegisteredInputs: []RegisteredInputProjection{}, Artifacts: []ArtifactProjection{},
-				Claims: []ClaimProjection{}, SourceReferences: []SourceReferenceProjection{}, EvidenceLinks: []EvidenceLinkProjection{},
-				Reviews: []ReviewProjection{}, Approvals: []ApprovalProjection{}, PolicyDecisions: []PolicyDecisionProjection{},
-				Deliveries: []DeliveryProjection{}, OpaqueFacts: []OpaqueFactProjection{},
-			})
-		case KindRunRecorded:
-			decoded, _ := decodeRunPayload(payload)
-			task := &projection.Tasks[taskIndexes[fact.TaskID]]
-			task.Runs = append(task.Runs, RunProjection{SourceFactID: fact.FactID, StartedAt: decoded.StartedAt, EndedAt: decoded.EndedAt, Outcome: decoded.Outcome})
-		case KindInputRegistered:
-			content, _ := decodeInputPayload(payload)
-			task := &projection.Tasks[taskIndexes[fact.TaskID]]
-			task.RegisteredInputs = append(task.RegisteredInputs, RegisteredInputProjection{SourceFactID: fact.FactID, Content: content})
-		case KindArtifactRecorded:
-			decoded, _ := decodeArtifactPayload(payload)
-			task := &projection.Tasks[taskIndexes[fact.TaskID]]
-			task.Artifacts = append(task.Artifacts, ArtifactProjection{SourceFactID: fact.FactID, Content: decoded.Content, Run: decoded.Run})
-		case KindClaimRecorded:
-			decoded, _ := decodeClaimPayload(payload)
-			task := &projection.Tasks[taskIndexes[fact.TaskID]]
-			task.Claims = append(task.Claims, ClaimProjection{SourceFactID: fact.FactID, Statement: decoded.Statement, OriginArtifact: decoded.OriginArtifact})
-		case KindSourceReferenceRecorded:
-			decoded, _ := decodeSourceReferencePayload(payload)
-			task := &projection.Tasks[taskIndexes[fact.TaskID]]
-			task.SourceReferences = append(task.SourceReferences, SourceReferenceProjection{SourceFactID: fact.FactID, Content: decoded.Content, Anchor: decoded.Anchor})
-		case KindEvidenceLinked:
-			decoded, _ := decodeEvidenceLinkPayload(payload)
-			task := &projection.Tasks[taskIndexes[fact.TaskID]]
-			task.EvidenceLinks = append(task.EvidenceLinks, EvidenceLinkProjection{SourceFactID: fact.FactID, Claim: decoded.Claim, Source: decoded.Source})
-		case KindReviewRecorded:
-			decoded, _ := decodeReviewPayload(payload)
-			task := &projection.Tasks[taskIndexes[fact.TaskID]]
-			task.Reviews = append(task.Reviews, ReviewProjection{SourceFactID: fact.FactID, Subject: decoded.Subject, Outcome: decoded.Outcome, Findings: decoded.Findings})
-		case KindApprovalRecorded:
-			decoded, _ := decodeApprovalPayload(payload)
-			task := &projection.Tasks[taskIndexes[fact.TaskID]]
-			task.Approvals = append(task.Approvals, ApprovalProjection{SourceFactID: fact.FactID, Subject: decoded.Subject, Scope: decoded.Scope, Decision: decoded.Decision, Note: decoded.Note})
-		case KindPolicyDecisionRecorded:
-			decoded, _ := decodePolicyDecisionPayload(payload)
-			task := &projection.Tasks[taskIndexes[fact.TaskID]]
-			task.PolicyDecisions = append(task.PolicyDecisions, PolicyDecisionProjection{SourceFactID: fact.FactID, Subject: decoded.Subject, Action: decoded.Action, Policy: decoded.Policy, Result: decoded.Result})
-		case KindDeliveryRecorded:
-			decoded, _ := decodeDeliveryPayload(payload)
-			task := &projection.Tasks[taskIndexes[fact.TaskID]]
-			task.Deliveries = append(task.Deliveries, DeliveryProjection{SourceFactID: fact.FactID, Artifacts: decoded.Artifacts, Format: decoded.Format, Scope: decoded.Scope, Target: decoded.Target})
-		case KindOpaqueRecorded:
-			decoded, _ := decodeOpaquePayload(payload)
-			opaque := OpaqueFactProjection{SourceFactID: fact.FactID, Kind: decoded.Kind, Data: decoded.Data}
-			if taskIndex, found := taskIndexes[fact.TaskID]; found {
-				projection.Tasks[taskIndex].OpaqueFacts = append(projection.Tasks[taskIndex].OpaqueFacts, opaque)
-			} else {
-				projection.OpaqueFacts = append(projection.OpaqueFacts, opaque)
-			}
+type projectionBuilder struct {
+	projection  Projection
+	taskIndexes map[string]int
+}
+
+func newProjectionBuilder() *projectionBuilder {
+	return &projectionBuilder{
+		projection:  Projection{Tasks: []TaskProjection{}, OpaqueFacts: []OpaqueFactProjection{}},
+		taskIndexes: make(map[string]int),
+	}
+}
+
+func (b *projectionBuilder) add(fact Fact, payload json.RawMessage) {
+	switch fact.Kind {
+	case KindTaskCreated:
+		definition, _ := decodeTaskPayload(payload)
+		b.taskIndexes[fact.TaskID] = len(b.projection.Tasks)
+		b.projection.Tasks = append(b.projection.Tasks, TaskProjection{
+			TaskID: fact.TaskID, SourceFactID: fact.FactID, Definition: definition,
+			Runs: []RunProjection{}, RegisteredInputs: []RegisteredInputProjection{}, Artifacts: []ArtifactProjection{},
+			Claims: []ClaimProjection{}, SourceReferences: []SourceReferenceProjection{}, EvidenceLinks: []EvidenceLinkProjection{},
+			Reviews: []ReviewProjection{}, Approvals: []ApprovalProjection{}, PolicyDecisions: []PolicyDecisionProjection{},
+			Deliveries: []DeliveryProjection{}, OpaqueFacts: []OpaqueFactProjection{},
+		})
+	case KindRunRecorded:
+		decoded, _ := decodeRunPayload(payload)
+		task := &b.projection.Tasks[b.taskIndexes[fact.TaskID]]
+		task.Runs = append(task.Runs, RunProjection{SourceFactID: fact.FactID, StartedAt: decoded.StartedAt, EndedAt: decoded.EndedAt, Outcome: decoded.Outcome})
+	case KindInputRegistered:
+		content, _ := decodeInputPayload(payload)
+		task := &b.projection.Tasks[b.taskIndexes[fact.TaskID]]
+		task.RegisteredInputs = append(task.RegisteredInputs, RegisteredInputProjection{SourceFactID: fact.FactID, Content: content})
+	case KindArtifactRecorded:
+		decoded, _ := decodeArtifactPayload(payload)
+		task := &b.projection.Tasks[b.taskIndexes[fact.TaskID]]
+		task.Artifacts = append(task.Artifacts, ArtifactProjection{SourceFactID: fact.FactID, Content: decoded.Content, Run: decoded.Run})
+	case KindClaimRecorded:
+		decoded, _ := decodeClaimPayload(payload)
+		task := &b.projection.Tasks[b.taskIndexes[fact.TaskID]]
+		task.Claims = append(task.Claims, ClaimProjection{SourceFactID: fact.FactID, Statement: decoded.Statement, OriginArtifact: decoded.OriginArtifact})
+	case KindSourceReferenceRecorded:
+		decoded, _ := decodeSourceReferencePayload(payload)
+		task := &b.projection.Tasks[b.taskIndexes[fact.TaskID]]
+		task.SourceReferences = append(task.SourceReferences, SourceReferenceProjection{SourceFactID: fact.FactID, Content: decoded.Content, Anchor: decoded.Anchor})
+	case KindEvidenceLinked:
+		decoded, _ := decodeEvidenceLinkPayload(payload)
+		task := &b.projection.Tasks[b.taskIndexes[fact.TaskID]]
+		task.EvidenceLinks = append(task.EvidenceLinks, EvidenceLinkProjection{SourceFactID: fact.FactID, Claim: decoded.Claim, Source: decoded.Source})
+	case KindReviewRecorded:
+		decoded, _ := decodeReviewPayload(payload)
+		task := &b.projection.Tasks[b.taskIndexes[fact.TaskID]]
+		task.Reviews = append(task.Reviews, ReviewProjection{SourceFactID: fact.FactID, Subject: decoded.Subject, Outcome: decoded.Outcome, Findings: decoded.Findings})
+	case KindApprovalRecorded:
+		decoded, _ := decodeApprovalPayload(payload)
+		task := &b.projection.Tasks[b.taskIndexes[fact.TaskID]]
+		task.Approvals = append(task.Approvals, ApprovalProjection{SourceFactID: fact.FactID, Subject: decoded.Subject, Scope: decoded.Scope, Decision: decoded.Decision, Note: decoded.Note})
+	case KindPolicyDecisionRecorded:
+		decoded, _ := decodePolicyDecisionPayload(payload)
+		task := &b.projection.Tasks[b.taskIndexes[fact.TaskID]]
+		task.PolicyDecisions = append(task.PolicyDecisions, PolicyDecisionProjection{SourceFactID: fact.FactID, Subject: decoded.Subject, Action: decoded.Action, Policy: decoded.Policy, Result: decoded.Result})
+	case KindDeliveryRecorded:
+		decoded, _ := decodeDeliveryPayload(payload)
+		task := &b.projection.Tasks[b.taskIndexes[fact.TaskID]]
+		task.Deliveries = append(task.Deliveries, DeliveryProjection{SourceFactID: fact.FactID, Artifacts: decoded.Artifacts, Format: decoded.Format, Scope: decoded.Scope, Target: decoded.Target})
+	case KindOpaqueRecorded:
+		decoded, _ := decodeOpaquePayload(payload)
+		opaque := OpaqueFactProjection{SourceFactID: fact.FactID, Kind: decoded.Kind, Data: decoded.Data}
+		if taskIndex, found := b.taskIndexes[fact.TaskID]; found {
+			b.projection.Tasks[taskIndex].OpaqueFacts = append(b.projection.Tasks[taskIndex].OpaqueFacts, opaque)
+		} else {
+			b.projection.OpaqueFacts = append(b.projection.OpaqueFacts, opaque)
 		}
 	}
-	return projection
+}
+
+func (b *projectionBuilder) result(workspaceID, format, integrity string) Projection {
+	b.projection.WorkspaceID = workspaceID
+	b.projection.Format = format
+	b.projection.Integrity = integrity
+	return b.projection
 }
 
 func (w *Workspace) Verify() (Verification, error) {
@@ -493,11 +502,11 @@ func (w *Workspace) Verify() (Verification, error) {
 	}
 	defer unlockDirectory(lock)
 
-	_, verification, err := w.readHistory()
+	_, verification, err := w.readHistory(nil)
 	return verification, err
 }
 
-func (w *Workspace) readHistory() (history, Verification, error) {
+func (w *Workspace) readHistory(sink factSink) (history, Verification, error) {
 	ledgerPath := filepath.Join(w.path, ".mcr", "events.jsonl")
 	ledger, _, err := openRegular(ledgerPath)
 	if err != nil {
@@ -511,9 +520,9 @@ func (w *Workspace) readHistory() (history, Verification, error) {
 	var h history
 	var verification Verification
 	if format == "legacy" {
-		h, verification, err = parseLegacy(ledger)
+		h, verification, err = parseLegacy(ledger, sink)
 	} else {
-		h, verification, err = parseNative(ledger)
+		h, verification, err = parseNative(ledger, sink)
 	}
 	if err != nil {
 		return history{}, Verification{}, fmt.Errorf("read workspace ledger: %w", err)
@@ -572,7 +581,7 @@ func inspectLegacyCache(workspacePath string, h history, verification Verificati
 	return diagnostics
 }
 
-func parseNative(ledger io.ReadSeeker) (history, Verification, error) {
+func parseNative(ledger io.ReadSeeker, sink factSink) (history, Verification, error) {
 	v := Verification{Format: "native", Diagnostics: []Diagnostic{}}
 	recordCount, blankLine, invalidEncoding, missingNewline, err := inspectNativeRecords(ledger)
 	if err != nil {
@@ -616,9 +625,8 @@ func parseNative(ledger io.ReadSeeker) (history, Verification, error) {
 		return history{}, invalidVerificationWithCount("record_hash_mismatch", 1, header.WorkspaceID, "workspace header hash does not match", recordCount), nil
 	}
 
-	h := history{header: header, facts: make([]Fact, 0, recordCount-1)}
-	state := newNativeState(nil)
-	seenFactIDs := make(map[string]bool, recordCount-1)
+	h := history{header: header, lastRecordHash: header.RecordHash}
+	state := newNativeState(recordCount - 1)
 	previousHash := header.RecordHash
 	lastID := header.WorkspaceID
 	for number := 2; number <= recordCount; number++ {
@@ -637,10 +645,9 @@ func parseNative(ledger io.ReadSeeker) (history, Verification, error) {
 		if err := strictDecode(line, &record); err != nil || record.RecordType != "fact" || record.FactID == "" || record.TaskID == "" || record.Actor.Type == "" || record.Actor.ID == "" || !validUTCTimestamp(record.RecordedAt) || !nativeHash.MatchString(record.PrevHash) || !nativeHash.MatchString(record.RecordHash) {
 			return history{}, invalidVerificationWithCount("invalid_fact_envelope", number, record.FactID, "fact envelope values are invalid", recordCount), nil
 		}
-		if seenFactIDs[record.FactID] {
+		if _, found := state.facts[record.FactID]; found {
 			return history{}, invalidVerificationWithCount("duplicate_fact_id", number, record.FactID, "Fact ID is not unique", recordCount), nil
 		}
-		seenFactIDs[record.FactID] = true
 		if record.PrevHash != previousHash {
 			return history{}, invalidVerificationWithCount("previous_hash_mismatch", number, record.FactID, "previous hash does not match", recordCount), nil
 		}
@@ -661,11 +668,16 @@ func parseNative(ledger io.ReadSeeker) (history, Verification, error) {
 		if err != nil {
 			return history{}, invalidVerificationWithCount(code, number, record.FactID, err.Error(), recordCount), nil
 		}
-		h.facts = append(h.facts, record.fact())
-		state.add(h.facts[len(h.facts)-1])
+		fact := record.fact()
+		if sink != nil {
+			sink(fact, fact.Payload)
+		}
+		state.add(fact)
 		previousHash = record.RecordHash
 		lastID = record.FactID
 	}
+	h.state = state
+	h.lastRecordHash = previousHash
 	v.StructuralValid = true
 	v.Integrity = IntegritySealedValid
 	v.LastRecordID = lastID
@@ -721,11 +733,10 @@ func readNativeRecord(reader *bufio.Reader) ([]byte, error) {
 	return line[:len(line)-1], nil
 }
 
-func validateSubmission(submission Submission, h history) error {
+func validateSubmission(submission Submission, state nativeState) error {
 	if submission.TaskID == "" || submission.Actor.Type == "" || submission.Actor.ID == "" || submission.Kind == "" {
 		return fmt.Errorf("%w: task ID, actor, and kind are required", ErrInvalidSubmission)
 	}
-	state := newNativeState(h.facts)
 	_, err := state.validate(submission.TaskID, submission.Kind, submission.Payload)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidSubmission, err)
@@ -1006,7 +1017,7 @@ func validFactRef(ref FactRef) bool {
 	return ref.FactID != "" && nativeHash.MatchString(ref.RecordHash)
 }
 
-func validateFactReference(taskID string, ref *FactRef, prior map[string]Fact, kind, name string) error {
+func validateFactReference(taskID string, ref *FactRef, prior map[string]factTarget, kind, name string) error {
 	if ref == nil {
 		return nil
 	}
@@ -1221,18 +1232,14 @@ func requireRegular(path string) error {
 	return nil
 }
 
-func newFactID(existing []Fact) (string, error) {
-	known := make(map[string]struct{}, len(existing))
-	for _, fact := range existing {
-		known[fact.FactID] = struct{}{}
-	}
+func newFactID(existing map[string]factTarget) (string, error) {
 	for {
 		buf := make([]byte, 16)
 		if _, err := rand.Read(buf); err != nil {
 			return "", err
 		}
 		id := "fact_" + hex.EncodeToString(buf)
-		if _, found := known[id]; !found {
+		if _, found := existing[id]; !found {
 			return id, nil
 		}
 	}

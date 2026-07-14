@@ -3,6 +3,7 @@ package mcr_test
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +11,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
+	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -362,6 +366,157 @@ func TestWorkspaceConcurrentWritersAndLargeRecords(t *testing.T) {
 	if err != nil || verification.Integrity != mcr.IntegritySealedValid || verification.RecordCount != wantFacts+1 {
 		t.Fatalf("Verify concurrent history = %+v, %v", verification, err)
 	}
+}
+
+func TestVerifyAndFilteredQueryDoNotRetainUnmatchedPayloads(t *testing.T) {
+	header, fixtureFacts := readNativeFixture(t)
+	taskFact := fixtureFacts[nativeFactIndex(t, fixtureFacts, mcr.KindTaskCreated)]
+	opaqueTemplate := fixtureFacts[nativeFactIndex(t, fixtureFacts, mcr.KindOpaqueRecorded)]
+	largeValue := strings.Repeat("x", 1024*1024)
+	payload, err := json.Marshal(map[string]any{"kind": "test.streaming", "data": map[string]any{"value": largeValue}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	streamFacts := make([]nativeTestFact, 1, 25)
+	streamFacts[0] = taskFact
+	for index := range 24 {
+		fact := opaqueTemplate
+		fact.FactID = fmt.Sprintf("fact_stream_%02d", index)
+		fact.TaskID = taskFact.TaskID
+		fact.Payload = payload
+		streamFacts = append(streamFacts, fact)
+	}
+	matchedFactID := streamFacts[len(streamFacts)-1].FactID
+	ledger := sealNativeLedger(t, header, streamFacts)
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, ".mcr"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".mcr", "events.jsonl"), ledger, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	largeValue, payload, ledger, streamFacts = "", nil, nil, nil
+
+	const maxResidentSetGrowth = 20 * 1024 * 1024
+	verifyGrowth := workspaceResidentSetGrowth(t, root, "verify", "")
+	queryGrowth := workspaceResidentSetGrowth(t, root, "query", matchedFactID)
+	t.Logf("native resident-set growth: Verify=%d Query=%d", verifyGrowth, queryGrowth)
+	if verifyGrowth > maxResidentSetGrowth || queryGrowth > maxResidentSetGrowth {
+		t.Fatalf("resident-set growth: Verify=%d Query=%d, want each <= %d", verifyGrowth, queryGrowth, maxResidentSetGrowth)
+	}
+
+	largeValue = strings.Repeat("x", 1024*1024)
+	var legacyLedger bytes.Buffer
+	encoder := json.NewEncoder(&legacyLedger)
+	if err := encoder.Encode(map[string]any{
+		"event_id": "legacy-header", "event_type": "McrInitialized", "timestamp": "2026-01-02T03:04:05Z",
+		"actor": map[string]any{"type": "test", "id": "streaming"}, "payload": map[string]any{"workspace_id": "workspace-legacy-streaming"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := encoder.Encode(map[string]any{
+		"event_id": "legacy-task", "event_type": "TaskCreated", "timestamp": "2026-01-02T03:04:06Z",
+		"actor": map[string]any{"type": "test", "id": "streaming"}, "payload": map[string]any{
+			"task_id": "task-1", "definition": map[string]any{
+				"namespace": "test", "id": "streaming", "version": "1", "locator": "urn:test:streaming", "sha256": digest,
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	lastLegacyID := ""
+	for index := range 24 {
+		lastLegacyID = fmt.Sprintf("legacy-stream-%02d", index)
+		if err := encoder.Encode(map[string]any{
+			"event_id": lastLegacyID, "event_type": "FutureStreamingEvent", "timestamp": "2026-01-02T03:04:07Z",
+			"actor":   map[string]any{"type": "test", "id": "streaming"},
+			"payload": map[string]any{"task_id": "task-1", "value": largeValue},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	legacyRoot := t.TempDir()
+	if err := os.Mkdir(filepath.Join(legacyRoot, ".mcr"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyRoot, ".mcr", "events.jsonl"), legacyLedger.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	largeValue = ""
+	legacyLedger = bytes.Buffer{}
+	legacyVerifyGrowth := workspaceResidentSetGrowth(t, legacyRoot, "verify", "")
+	legacyQueryGrowth := workspaceResidentSetGrowth(t, legacyRoot, "query", lastLegacyID)
+	t.Logf("legacy resident-set growth: Verify=%d Query=%d", legacyVerifyGrowth, legacyQueryGrowth)
+	if legacyVerifyGrowth > maxResidentSetGrowth || legacyQueryGrowth > maxResidentSetGrowth {
+		t.Fatalf("legacy resident-set growth: Verify=%d Query=%d, want each <= %d", legacyVerifyGrowth, legacyQueryGrowth, maxResidentSetGrowth)
+	}
+}
+
+func TestWorkspaceRetainedMemoryHelper(t *testing.T) {
+	root := os.Getenv("MCR_TEST_MEMORY_ROOT")
+	if root == "" {
+		return
+	}
+	workspace, err := mcr.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	debug.SetGCPercent(10)
+	runtime.GC()
+	var before syscall.Rusage
+	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &before); err != nil {
+		t.Fatal(err)
+	}
+	switch os.Getenv("MCR_TEST_MEMORY_OPERATION") {
+	case "verify":
+		_, err = workspace.Verify()
+	case "query":
+		var facts []mcr.Fact
+		facts, err = workspace.Query(mcr.FactQuery{FactID: os.Getenv("MCR_TEST_MEMORY_FACT_ID")})
+		if err == nil && len(facts) != 1 {
+			err = fmt.Errorf("filtered Query returned %d Facts", len(facts))
+		}
+	default:
+		err = errors.New("unknown memory operation")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	var after syscall.Rusage
+	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &after); err != nil {
+		t.Fatal(err)
+	}
+	growth := after.Maxrss - before.Maxrss
+	if runtime.GOOS == "linux" {
+		growth *= 1024
+	}
+	fmt.Printf("resident_set_growth=%d\n", growth)
+}
+
+func workspaceResidentSetGrowth(t *testing.T, root, operation, factID string) uint64 {
+	t.Helper()
+	command := exec.Command(os.Args[0], "-test.run=^TestWorkspaceRetainedMemoryHelper$")
+	command.Env = append(os.Environ(),
+		"MCR_TEST_MEMORY_ROOT="+root,
+		"MCR_TEST_MEMORY_OPERATION="+operation,
+		"MCR_TEST_MEMORY_FACT_ID="+factID,
+	)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("memory helper: %v\n%s", err, output)
+	}
+	for _, line := range strings.Split(string(output), "\n") {
+		const prefix = "resident_set_growth="
+		if strings.HasPrefix(line, prefix) {
+			growth, err := strconv.ParseUint(strings.TrimPrefix(line, prefix), 10, 64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return growth
+		}
+	}
+	t.Fatalf("memory helper did not report resident-set growth:\n%s", output)
+	return 0
 }
 
 func TestLegacyStorageFreshnessLargeRecordAndNoReplace(t *testing.T) {

@@ -53,13 +53,13 @@ func detectHistoryFormat(ledger io.ReadSeeker) (string, error) {
 	return "native", nil
 }
 
-func parseLegacy(ledger io.ReadSeeker) (history, Verification, error) {
-	v := Verification{Format: formatLegacy, Diagnostics: []Diagnostic{}}
+func parseLegacy(ledger io.ReadSeeker, sink factSink) (history, Verification, error) {
+	verification := Verification{Format: formatLegacy, Diagnostics: []Diagnostic{}}
 	recordCount, blankLine, invalidEncoding, missingNewline, err := inspectNativeRecords(ledger)
 	if err != nil {
 		return history{}, Verification{}, err
 	}
-	v.RecordCount = recordCount
+	verification.RecordCount = recordCount
 	if invalidEncoding {
 		return history{}, invalidLegacyVerification("invalid_encoding", 0, "", "ledger must be UTF-8 without BOM", recordCount), nil
 	}
@@ -73,18 +73,17 @@ func parseLegacy(ledger io.ReadSeeker) (history, Verification, error) {
 		return history{}, Verification{}, err
 	}
 
-	h := history{format: formatLegacy, readOnly: true, facts: make([]Fact, 0, recordCount-1), semanticPayloads: make([]json.RawMessage, 0, recordCount-1), semanticTaskIDs: make([]string, 0, recordCount-1), rawLines: make([][]byte, 0, recordCount)}
-	events := make([]legacyEvent, 0, recordCount)
+	parsedHistory := history{format: formatLegacy, readOnly: true}
 	reader := bufio.NewReader(ledger)
 	seen := make(map[string]bool, recordCount)
-	state := newNativeState(nil)
+	state := newNativeState(recordCount - 1)
+	integrity := newLegacyIntegrityState()
 	lastID := ""
 	for number := 1; number <= recordCount; number++ {
 		line, err := readNativeRecord(reader)
 		if err != nil {
 			return history{}, Verification{}, err
 		}
-		h.rawLines = append(h.rawLines, append([]byte(nil), line...))
 		event, diagnostic := decodeLegacyEvent(line, number, recordCount)
 		if diagnostic != nil {
 			return history{}, *diagnostic, nil
@@ -98,7 +97,7 @@ func parseLegacy(ledger io.ReadSeeker) (history, Verification, error) {
 			if event.EventType != "McrInitialized" || !ok || workspaceID == "" {
 				return history{}, invalidLegacyVerification("invalid_header", number, event.EventID, "first legacy event must initialize a non-empty workspace ID", recordCount), nil
 			}
-			h.header = workspaceHeader{WorkspaceID: workspaceID, RecordedAt: event.Timestamp, PrevHash: event.PrevHash, RecordHash: event.EventHash}
+			parsedHistory.header = workspaceHeader{WorkspaceID: workspaceID, RecordedAt: event.Timestamp, PrevHash: event.PrevHash, RecordHash: event.EventHash}
 		} else {
 			if event.EventType == "McrInitialized" {
 				return history{}, invalidLegacyVerification("invalid_event_envelope", number, event.EventID, "legacy initialization event must be unique and first", recordCount), nil
@@ -108,18 +107,20 @@ func parseLegacy(ledger io.ReadSeeker) (history, Verification, error) {
 			if validateErr != nil {
 				return history{}, invalidLegacyVerification(code, number, event.EventID, validateErr.Error(), recordCount), nil
 			}
-			h.facts = append(h.facts, fact)
-			h.semanticTaskIDs = append(h.semanticTaskIDs, semanticTaskID)
-			h.semanticPayloads = append(h.semanticPayloads, semanticPayload)
+			if sink != nil {
+				sink(fact, semanticPayload)
+			}
 			state.add(fact)
 		}
-		events = append(events, event)
+		integrity.add(event, number)
 		lastID = event.EventID
+		parsedHistory.lastRecordHash = event.EventHash
 	}
-	v.StructuralValid = true
-	v.LastRecordID = lastID
-	v.Integrity, v.Diagnostics = classifyLegacyIntegrity(events)
-	return h, v, nil
+	parsedHistory.state = state
+	verification.StructuralValid = true
+	verification.LastRecordID = lastID
+	verification.Integrity, verification.Diagnostics = integrity.result()
+	return parsedHistory, verification, nil
 }
 
 func decodeLegacyEvent(line []byte, number, count int) (legacyEvent, *Verification) {
@@ -158,53 +159,60 @@ func decodeLegacyEvent(line []byte, number, count int) (legacyEvent, *Verificati
 	return event, nil
 }
 
-func classifyLegacyIntegrity(events []legacyEvent) (string, []Diagnostic) {
-	allAbsent, allPresent := true, true
-	for _, event := range events {
-		allAbsent = allAbsent && !event.prevPresent && !event.eventPresent
-		allPresent = allPresent && event.prevPresent && event.eventPresent
+type legacyIntegrityState struct {
+	allAbsent          bool
+	allPresent         bool
+	previousHash       string
+	partialDiagnostics []Diagnostic
+	sealedDiagnostics  []Diagnostic
+}
+
+func newLegacyIntegrityState() legacyIntegrityState {
+	return legacyIntegrityState{allAbsent: true, allPresent: true, previousHash: zeroHash}
+}
+
+func (s *legacyIntegrityState) add(event legacyEvent, number int) {
+	s.allAbsent = s.allAbsent && !event.prevPresent && !event.eventPresent
+	s.allPresent = s.allPresent && event.prevPresent && event.eventPresent
+	if !event.prevPresent {
+		s.partialDiagnostics = append(s.partialDiagnostics, legacyIntegrityDiagnostic("missing_previous_hash", number, event.EventID, "legacy event is missing prev_hash"))
 	}
-	if allAbsent {
-		return IntegrityUnsealed, []Diagnostic{}
+	if !event.eventPresent {
+		s.partialDiagnostics = append(s.partialDiagnostics, legacyIntegrityDiagnostic("missing_event_hash", number, event.EventID, "legacy event is missing event_hash"))
 	}
-	if !allPresent {
-		diagnostics := make([]Diagnostic, 0)
-		for index, event := range events {
-			if !event.prevPresent {
-				diagnostics = append(diagnostics, legacyIntegrityDiagnostic("missing_previous_hash", index+1, event.EventID, "legacy event is missing prev_hash"))
-			}
-			if !event.eventPresent {
-				diagnostics = append(diagnostics, legacyIntegrityDiagnostic("missing_event_hash", index+1, event.EventID, "legacy event is missing event_hash"))
-			}
-		}
-		return IntegrityPartialInvalid, diagnostics
-	}
-	diagnostics := make([]Diagnostic, 0)
-	previousHash := zeroHash
-	for index, event := range events {
+	if event.prevPresent && event.eventPresent {
 		previousValid := nativeHash.MatchString(event.PrevHash)
 		eventValid := nativeHash.MatchString(event.EventHash)
 		if !previousValid {
-			diagnostics = append(diagnostics, legacyIntegrityDiagnostic("invalid_previous_hash", index+1, event.EventID, "legacy previous hash spelling is invalid"))
+			s.sealedDiagnostics = append(s.sealedDiagnostics, legacyIntegrityDiagnostic("invalid_previous_hash", number, event.EventID, "legacy previous hash spelling is invalid"))
 		}
 		if !eventValid {
-			diagnostics = append(diagnostics, legacyIntegrityDiagnostic("invalid_event_hash", index+1, event.EventID, "legacy event hash spelling is invalid"))
+			s.sealedDiagnostics = append(s.sealedDiagnostics, legacyIntegrityDiagnostic("invalid_event_hash", number, event.EventID, "legacy event hash spelling is invalid"))
 		}
-		if previousValid && event.PrevHash != previousHash {
-			diagnostics = append(diagnostics, legacyIntegrityDiagnostic("previous_hash_mismatch", index+1, event.EventID, "previous hash does not match"))
+		if previousValid && event.PrevHash != s.previousHash {
+			s.sealedDiagnostics = append(s.sealedDiagnostics, legacyIntegrityDiagnostic("previous_hash_mismatch", number, event.EventID, "previous hash does not match"))
 		}
 		if previousValid {
 			expected, err := hashLegacyEvent(event)
 			if err == nil && eventValid && event.EventHash != expected {
-				diagnostics = append(diagnostics, legacyIntegrityDiagnostic("event_hash_mismatch", index+1, event.EventID, "legacy event hash does not match"))
+				s.sealedDiagnostics = append(s.sealedDiagnostics, legacyIntegrityDiagnostic("event_hash_mismatch", number, event.EventID, "legacy event hash does not match"))
 			}
 		}
-		previousHash = event.EventHash
 	}
-	if len(diagnostics) != 0 {
-		return IntegritySealedInvalid, diagnostics
+	s.previousHash = event.EventHash
+}
+
+func (s legacyIntegrityState) result() (string, []Diagnostic) {
+	if s.allAbsent {
+		return IntegrityUnsealed, []Diagnostic{}
 	}
-	return IntegritySealedValid, diagnostics
+	if !s.allPresent {
+		return IntegrityPartialInvalid, s.partialDiagnostics
+	}
+	if len(s.sealedDiagnostics) != 0 {
+		return IntegritySealedInvalid, s.sealedDiagnostics
+	}
+	return IntegritySealedValid, []Diagnostic{}
 }
 
 func legacyIntegrityDiagnostic(code string, number int, id, message string) Diagnostic {
