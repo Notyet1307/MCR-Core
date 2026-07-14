@@ -1086,6 +1086,13 @@ func (w *Workspace) appendRecord(line []byte) error {
 }
 
 func (w *Workspace) lock(exclusive bool) (*os.File, error) {
+	canonical, err := canonicalExistingDirectory(w.path)
+	if err != nil {
+		return nil, err
+	}
+	if canonical != w.path {
+		return nil, fmt.Errorf("%w: workspace path no longer resolves to its canonical location", ErrConflict)
+	}
 	return lockDirectory(filepath.Join(w.path, ".mcr"), exclusive)
 }
 

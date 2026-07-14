@@ -104,6 +104,58 @@ func TestWorkspaceStorageContainmentAndPermissions(t *testing.T) {
 		}
 	})
 
+	t.Run("canonical root replacement rejects every operation", func(t *testing.T) {
+		parent := t.TempDir()
+		root := filepath.Join(parent, "workspace")
+		target := filepath.Join(parent, "target")
+		if err := os.Mkdir(root, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(target, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		workspace, err := mcr.Create(root, "workspace-storage")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := mcr.Create(target, "workspace-target"); err != nil {
+			t.Fatal(err)
+		}
+		targetLedger := filepath.Join(target, ".mcr", "events.jsonl")
+		before, err := os.ReadFile(targetLedger)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(root, filepath.Join(parent, "moved")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, root); err != nil {
+			t.Fatal(err)
+		}
+
+		operations := []struct {
+			name string
+			run  func() error
+		}{
+			{"Submit", func() error { _, err := workspace.Submit(validTaskSubmission("escape-task")); return err }},
+			{"Query", func() error { _, err := workspace.Query(mcr.FactQuery{}); return err }},
+			{"Replay", func() error { _, err := workspace.Replay(); return err }},
+			{"Verify", func() error { _, err := workspace.Verify(); return err }},
+		}
+		for _, operation := range operations {
+			if err := operation.run(); !errors.Is(err, mcr.ErrConflict) {
+				t.Errorf("%s after root replacement = %v, want ErrConflict", operation.name, err)
+			}
+		}
+		after, err := os.ReadFile(targetLedger)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(after, before) {
+			t.Fatal("replacement target ledger changed")
+		}
+	})
+
 	t.Run("open preserves existing permissions", func(t *testing.T) {
 		root := t.TempDir()
 		workspace, err := mcr.Create(root, "workspace-storage")
