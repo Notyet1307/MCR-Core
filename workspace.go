@@ -613,10 +613,10 @@ func parseNative(ledger io.ReadSeeker, sink factSink) (history, Verification, er
 		return history{}, Verification{}, err
 	}
 	if invalidEncoding {
-		return history{}, invalidVerification("invalid_encoding", 0, "", "ledger must be UTF-8 without BOM"), nil
+		return history{}, invalidVerificationWithCount("invalid_encoding", 0, "", "ledger must be UTF-8 without BOM", recordCount), nil
 	}
 	if missingNewline {
-		return history{}, invalidVerification("missing_newline", 0, "", "every record must end with a newline"), nil
+		return history{}, invalidVerificationWithCount("missing_newline", 0, "", "every record must end with a newline", recordCount), nil
 	}
 	v.RecordCount = recordCount
 	if blankLine != 0 {
@@ -718,10 +718,10 @@ func inspectNativeRecords(ledger io.ReadSeeker) (recordCount, blankLine int, inv
 	for {
 		line, readErr := reader.ReadBytes('\n')
 		if len(line) > 0 {
+			recordCount++
 			hasNewline := line[len(line)-1] == '\n'
 			if hasNewline {
 				line = line[:len(line)-1]
-				recordCount++
 			} else {
 				missingNewline = true
 			}

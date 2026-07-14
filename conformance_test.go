@@ -39,6 +39,43 @@ type nativeTestFact struct {
 	RecordHash string          `json:"record_hash"`
 }
 
+func TestMalformedHistoryRecordCounts(t *testing.T) {
+	native, err := os.ReadFile("testdata/native-task.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := os.ReadFile("testdata/legacy/unsealed-valid.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name, code string
+		ledger     []byte
+		count      int
+	}{
+		{"native BOM", "invalid_encoding", append([]byte{0xef, 0xbb, 0xbf}, native...), 15},
+		{"native invalid UTF-8", "invalid_encoding", append([]byte{0xff}, native...), 15},
+		{"native missing final newline", "missing_newline", bytes.TrimSuffix(native, []byte("\n")), 15},
+		{"legacy BOM", "invalid_encoding", append([]byte{0xef, 0xbb, 0xbf}, legacy...), 4},
+		{"legacy invalid UTF-8", "invalid_encoding", append([]byte{0xff}, legacy...), 4},
+		{"legacy missing final newline", "missing_newline", bytes.TrimSuffix(legacy, []byte("\n")), 4},
+		{"empty", "missing_newline", []byte{}, 0},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			workspacePath := writeLegacyWorkspace(t, test.ledger, nil)
+			workspace, err := mcr.Open(workspacePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			verification, err := workspace.Verify()
+			if err != nil || verification.RecordCount != test.count || len(verification.Diagnostics) == 0 || verification.Diagnostics[0].Code != test.code {
+				t.Fatalf("Verify malformed history = %#v, %v; want count=%d code=%s", verification, err, test.count, test.code)
+			}
+		})
+	}
+}
+
 func TestNativeStrictKindConformanceMatrix(t *testing.T) {
 	type invalidCase struct {
 		name   string
