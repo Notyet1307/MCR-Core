@@ -142,6 +142,9 @@ func (s *nativeState) validate(taskID, kind string, payload json.RawMessage) (st
 	if !isNativeKind(kind) {
 		return "unknown_kind", errors.New("native fact kind is not supported")
 	}
+	if taskID == "" && kind != KindOpaqueRecorded {
+		return "invalid_payload", errors.New("task ID is required")
+	}
 	taskExists := s.tasks[taskID]
 	if kind != KindTaskCreated && !taskExists && !(kind == KindOpaqueRecorded && taskID == "") {
 		return "invalid_payload", errors.New("task does not exist")

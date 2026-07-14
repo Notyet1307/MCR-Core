@@ -770,6 +770,124 @@ func TestLegacyContentCompleteInvalidDigestFailsClosed(t *testing.T) {
 	}
 }
 
+func TestLegacyTaskAndRunUnderboundRemainOpaque(t *testing.T) {
+	unsealed, err := os.ReadFile("testdata/legacy/unsealed-valid.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name, eventType, factID string
+		recordNumber, keep      int
+		payload                 map[string]any
+		taskScoped              bool
+	}{
+		{
+			name: "Task missing Definition digest", eventType: "TaskCreated", factID: "task@u-9", recordNumber: 2, keep: 2,
+			payload: map[string]any{"task_id": "task/u?opaque", "definition": map[string]any{
+				"namespace": "example", "id": "unsealed-task", "version": "1.0.0", "locator": "defs/unsealed.json",
+			}, "additive": "retained"},
+		},
+		{
+			name: "Run missing outcome", eventType: "RunCompleted", factID: "input#bare", recordNumber: 3, keep: 3, taskScoped: true,
+			payload: map[string]any{"task_id": "task/u?opaque", "started_at": "2025-02-03T04:05:07Z", "ended_at": "2025-02-03T04:05:08Z", "additive": "retained"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			mutated := mutateLegacyRecord(t, unsealed, test.recordNumber, func(values map[string]any) {
+				values["event_type"] = test.eventType
+				values["payload"] = test.payload
+			})
+			lines := bytes.Split(bytes.TrimSuffix(mutated, []byte("\n")), []byte("\n"))
+			mutated = append(bytes.Join(lines[:test.keep], []byte("\n")), '\n')
+			workspacePath := writeLegacyWorkspace(t, mutated, []byte("{}\n"))
+			before := snapshotFiles(t, workspacePath)
+			workspace, err := mcr.Open(workspacePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			verification, err := workspace.Verify()
+			if err != nil || !verification.StructuralValid || verification.Integrity != mcr.IntegrityUnsealed {
+				t.Fatalf("Verify under-bound %s = %#v, %v", test.eventType, verification, err)
+			}
+			facts, err := workspace.Query(mcr.FactQuery{FactID: test.factID})
+			if err != nil || len(facts) != 1 {
+				t.Fatalf("Query under-bound %s = %#v, %v", test.eventType, facts, err)
+			}
+			expectedPayload, err := json.Marshal(test.payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fact := facts[0]
+			if fact.TaskID != "task/u?opaque" || fact.Kind != mcr.KindOpaqueRecorded || !fact.Opaque || fact.OpaqueReason != "legacy_underbound" || !bytes.Equal(fact.Payload, expectedPayload) {
+				t.Fatalf("under-bound %s Fact = %#v, payload = %s", test.eventType, fact, fact.Payload)
+			}
+			projection, err := workspace.Replay()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var opaqueFacts []mcr.OpaqueFactProjection
+			if test.taskScoped {
+				if len(projection.Tasks) != 1 {
+					t.Fatalf("Replay Tasks = %#v", projection.Tasks)
+				}
+				opaqueFacts = projection.Tasks[0].OpaqueFacts
+			} else {
+				if len(projection.Tasks) != 0 {
+					t.Fatalf("under-bound Task created a typed projection: %#v", projection.Tasks)
+				}
+				opaqueFacts = projection.OpaqueFacts
+			}
+			if len(opaqueFacts) != 1 || opaqueFacts[0].SourceFactID != fact.FactID || opaqueFacts[0].Kind != test.eventType || !bytes.Equal(opaqueFacts[0].Data, expectedPayload) {
+				t.Fatalf("Replay under-bound %s = %#v", test.eventType, opaqueFacts)
+			}
+			if after := snapshotFiles(t, workspacePath); !reflect.DeepEqual(after, before) {
+				t.Fatal("legacy files changed")
+			}
+		})
+	}
+}
+
+func TestLegacyTaskAndRunCompleteInvalidValuesFailClosed(t *testing.T) {
+	unsealed, err := os.ReadFile("testdata/legacy/unsealed-valid.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name, eventType string
+		recordNumber    int
+		payload         map[string]any
+	}{
+		{
+			name: "Task invalid Definition digest", eventType: "TaskCreated", recordNumber: 2,
+			payload: map[string]any{"task_id": "task/u?opaque", "definition": map[string]any{
+				"namespace": "example", "id": "unsealed-task", "version": "1.0.0", "locator": "defs/unsealed.json", "sha256": "not-a-hash",
+			}},
+		},
+		{
+			name: "Run reversed interval", eventType: "RunCompleted", recordNumber: 3,
+			payload: map[string]any{"task_id": "task/u?opaque", "started_at": "2025-02-03T04:05:09Z", "ended_at": "2025-02-03T04:05:08Z", "outcome": "completed"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			mutated := mutateLegacyRecord(t, unsealed, test.recordNumber, func(values map[string]any) {
+				values["event_type"] = test.eventType
+				values["payload"] = test.payload
+			})
+			workspacePath := writeLegacyWorkspace(t, mutated, []byte("{}\n"))
+			workspace, err := mcr.Open(workspacePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			verification, err := workspace.Verify()
+			if err != nil || verification.StructuralValid || len(verification.Diagnostics) == 0 || verification.Diagnostics[0].Code != "invalid_payload" {
+				t.Fatalf("Verify complete invalid %s = %#v, %v", test.eventType, verification, err)
+			}
+		})
+	}
+}
+
 func TestLegacyGovernanceCompleteInvalidReferencesFailClosed(t *testing.T) {
 	unsealed, err := os.ReadFile("testdata/legacy/unsealed-valid.jsonl")
 	if err != nil {

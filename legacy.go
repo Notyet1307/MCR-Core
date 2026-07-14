@@ -242,17 +242,23 @@ func normalizeLegacyEvent(event legacyEvent, state nativeState) (Fact, string, j
 	sourceComplete := false
 	switch event.EventType {
 	case "TaskCreated":
-		kind = KindTaskCreated
-		semantic = marshalLegacySemantic(struct {
-			Definition json.RawMessage `json:"definition"`
-		}{values["definition"]})
+		sourceComplete = legacyKeysPresent(values, "task_id", "definition") && legacyObjectSourceComplete(values["definition"], "namespace", "id", "version", "locator", "sha256")
+		if sourceComplete {
+			kind = KindTaskCreated
+			semantic = marshalLegacySemantic(struct {
+				Definition json.RawMessage `json:"definition"`
+			}{values["definition"]})
+		}
 	case "RunCompleted":
-		kind = KindRunRecorded
-		semantic = marshalLegacySemantic(struct {
-			StartedAt json.RawMessage `json:"started_at"`
-			EndedAt   json.RawMessage `json:"ended_at"`
-			Outcome   json.RawMessage `json:"outcome"`
-		}{values["started_at"], values["ended_at"], values["outcome"]})
+		sourceComplete = legacyKeysPresent(values, "task_id", "started_at", "ended_at", "outcome")
+		if sourceComplete {
+			kind = KindRunRecorded
+			semantic = marshalLegacySemantic(struct {
+				StartedAt json.RawMessage `json:"started_at"`
+				EndedAt   json.RawMessage `json:"ended_at"`
+				Outcome   json.RawMessage `json:"outcome"`
+			}{values["started_at"], values["ended_at"], values["outcome"]})
+		}
 	case "InputRegistered":
 		if content, ok := legacyContent(values, "content", "stored_path", "sha256"); ok {
 			kind = KindInputRegistered
@@ -419,6 +425,14 @@ func legacyKeysPresent(values map[string]json.RawMessage, names ...string) bool 
 		}
 	}
 	return true
+}
+
+func legacyObjectSourceComplete(raw json.RawMessage, names ...string) bool {
+	var object map[string]json.RawMessage
+	if json.Unmarshal(raw, &object) != nil || object == nil {
+		return true
+	}
+	return legacyKeysPresent(object, names...)
 }
 
 func legacyRefSourceComplete(values map[string]json.RawMessage, name string) bool {
