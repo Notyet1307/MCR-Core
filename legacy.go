@@ -42,12 +42,12 @@ func detectHistoryFormat(ledger io.ReadSeeker) (string, error) {
 	line = line[:len(line)-1]
 	var fields map[string]json.RawMessage
 	if json.Unmarshal(line, &fields) == nil {
-		if _, native := fields["record_type"]; native {
-			return "native", nil
-		}
 		var eventType string
 		if raw, ok := fields["event_type"]; ok && json.Unmarshal(raw, &eventType) == nil && eventType == "McrInitialized" {
 			return formatLegacy, nil
+		}
+		if _, native := fields["record_type"]; native {
+			return "native", nil
 		}
 	}
 	return "native", nil
@@ -305,14 +305,16 @@ func normalizeLegacyEvent(event legacyEvent, state nativeState) (Fact, string, j
 
 func legacyContent(values map[string]json.RawMessage, nestedName, locatorName, digestName string) (json.RawMessage, bool) {
 	if nested := values[nestedName]; len(nested) != 0 {
-		object := legacyObject(nested)
+		var object map[string]json.RawMessage
+		if json.Unmarshal(nested, &object) != nil || object == nil {
+			return nested, true
+		}
 		locator, locatorOK := rawString(object["locator"])
 		digest, digestOK := rawString(object["sha256"])
-		if locatorOK && digestOK {
-			digest = normalizeLegacyDigest(digest)
-			return marshalLegacySemantic(ContentRef{Locator: locator, SHA256: digest}), true
+		if !locatorOK || !digestOK {
+			return nil, false
 		}
-		return nested, true
+		return marshalLegacySemantic(ContentRef{Locator: locator, SHA256: normalizeLegacyDigest(digest)}), true
 	}
 	locator, locatorOK := rawString(values[locatorName])
 	digest, digestOK := rawString(values[digestName])

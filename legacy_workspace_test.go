@@ -19,18 +19,18 @@ import (
 const firstLegacyEventHash = "sha256:a248bf58a7d763bd2030429a5af3bd8f78bf97a9af700055804f153886abc255"
 
 func TestSealedLegacyVerifyUsesLiteralHashVector(t *testing.T) {
-	workspace := copyLegacyWorkspace(t)
-	ws, err := mcr.Open(workspace)
+	workspacePath := copyLegacyWorkspace(t)
+	workspace, err := mcr.Open(workspacePath)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	verification, err := ws.Verify()
+	verification, err := workspace.Verify()
 	if err != nil {
 		t.Fatalf("Verify: %v", err)
 	}
 	assertJSONGolden(t, "testdata/legacy/sealed-valid.verify.json", verification)
 
-	ledger, err := os.ReadFile(filepath.Join(workspace, ".mcr", "events.jsonl"))
+	ledger, err := os.ReadFile(filepath.Join(workspacePath, ".mcr", "events.jsonl"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,6 +53,41 @@ func TestSealedLegacyVerifyUsesLiteralHashVector(t *testing.T) {
 	readJSONFile(t, "testdata/hashes/legacy-events.json", &vectors)
 	if len(vectors) == 0 || vectors[0].PreviousHash != first.PrevHash || vectors[0].ExpectedDigest != firstLegacyEventHash {
 		t.Fatalf("checked-in hash vector does not contain the literal first digest")
+	}
+}
+
+func TestLegacyHeaderAdditiveNativeFieldDoesNotChangeFormat(t *testing.T) {
+	sealed, err := os.ReadFile("testdata/legacy/sealed-valid.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	headerEnd := bytes.IndexByte(sealed, '\n')
+	mutated := append([]byte(nil), sealed[:headerEnd-1]...)
+	mutated = append(mutated, []byte(`,"record_type":"ignored-additive"}`)...)
+	mutated = append(mutated, '\n')
+	mutated = append(mutated, sealed[headerEnd+1:]...)
+	workspacePath := writeLegacyWorkspace(t, mutated, []byte(`{"workspace_id":"workspace/opaque","last_event_id":"unknown+extension"}`))
+	before := snapshotFiles(t, workspacePath)
+	workspace, err := mcr.Open(workspacePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verification, err := workspace.Verify()
+	if err != nil || verification.Format != "legacy" || verification.Integrity != mcr.IntegritySealedValid {
+		t.Fatalf("Verify additive legacy header = %#v, %v", verification, err)
+	}
+	facts, err := workspace.Query(mcr.FactQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertJSONGolden(t, "testdata/legacy/sealed-valid.query.json", facts)
+	projection, err := workspace.Replay()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertJSONGolden(t, "testdata/legacy/sealed-valid.replay.json", projection)
+	if after := snapshotFiles(t, workspacePath); !reflect.DeepEqual(after, before) {
+		t.Fatal("legacy files changed")
 	}
 }
 
@@ -652,6 +687,86 @@ func TestLegacyGovernanceUnderboundRemainsOpaque(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestLegacyContentUnderboundRemainsOpaque(t *testing.T) {
+	unsealed, err := os.ReadFile("testdata/legacy/unsealed-valid.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, eventType := range []string{"InputRegistered", "ArtifactAdded"} {
+		t.Run(eventType, func(t *testing.T) {
+			payload := map[string]any{
+				"task_id":  "task/u?opaque",
+				"content":  map[string]any{"locator": "inputs/incomplete.txt"},
+				"additive": "retained",
+			}
+			mutated := mutateLegacyRecord(t, unsealed, 3, func(values map[string]any) {
+				values["event_type"] = eventType
+				values["payload"] = payload
+			})
+			workspacePath := writeLegacyWorkspace(t, mutated, []byte("{}\n"))
+			before := snapshotFiles(t, workspacePath)
+			workspace, err := mcr.Open(workspacePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			verification, err := workspace.Verify()
+			if err != nil || !verification.StructuralValid || verification.Integrity != mcr.IntegrityUnsealed {
+				t.Fatalf("Verify under-bound content = %#v, %v", verification, err)
+			}
+			facts, err := workspace.Query(mcr.FactQuery{FactID: "input#bare"})
+			if err != nil || len(facts) != 1 {
+				t.Fatalf("Query under-bound content = %#v, %v", facts, err)
+			}
+			expectedPayload, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fact := facts[0]
+			if fact.Kind != mcr.KindOpaqueRecorded || !fact.Opaque || fact.OpaqueReason != "legacy_underbound" || !bytes.Equal(fact.Payload, expectedPayload) {
+				t.Fatalf("under-bound content Fact = %#v, payload = %s", fact, fact.Payload)
+			}
+			projection, err := workspace.Replay()
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, opaque := range projection.Tasks[0].OpaqueFacts {
+				if opaque.SourceFactID == fact.FactID && opaque.Kind == eventType && bytes.Equal(opaque.Data, expectedPayload) {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("Replay omitted under-bound content: %#v", projection.Tasks[0].OpaqueFacts)
+			}
+			if after := snapshotFiles(t, workspacePath); !reflect.DeepEqual(after, before) {
+				t.Fatal("legacy files changed")
+			}
+		})
+	}
+}
+
+func TestLegacyContentCompleteInvalidDigestFailsClosed(t *testing.T) {
+	unsealed, err := os.ReadFile("testdata/legacy/unsealed-valid.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutated := mutateLegacyRecord(t, unsealed, 3, func(values map[string]any) {
+		values["payload"] = map[string]any{
+			"task_id": "task/u?opaque",
+			"content": map[string]any{"locator": "inputs/invalid.txt", "sha256": "not-a-hash"},
+		}
+	})
+	workspacePath := writeLegacyWorkspace(t, mutated, []byte("{}\n"))
+	workspace, err := mcr.Open(workspacePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verification, err := workspace.Verify()
+	if err != nil || verification.StructuralValid || len(verification.Diagnostics) == 0 || verification.Diagnostics[0].Code != "invalid_payload" {
+		t.Fatalf("Verify complete invalid content = %#v, %v", verification, err)
 	}
 }
 
