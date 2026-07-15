@@ -995,6 +995,91 @@ func TestLegacyGovernanceCompleteInvalidReferencesFailClosed(t *testing.T) {
 	}
 }
 
+func TestLegacyPreTaskOpaqueCannotBecomeSameTaskReference(t *testing.T) {
+	type event struct {
+		EventID   string          `json:"event_id"`
+		EventType string          `json:"event_type"`
+		Timestamp string          `json:"timestamp"`
+		Actor     mcr.Actor       `json:"actor"`
+		PrevHash  string          `json:"prev_hash"`
+		EventHash string          `json:"event_hash"`
+		Payload   json.RawMessage `json:"payload"`
+	}
+	previousHash := "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+	var ledger bytes.Buffer
+	appendEvent := func(eventID, eventType string, payload any) string {
+		rawPayload, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		entry := event{
+			EventID: eventID, EventType: eventType, Timestamp: "2025-01-02T03:04:05Z",
+			Actor: mcr.Actor{Type: "human", ID: "tester"}, PrevHash: previousHash, Payload: rawPayload,
+		}
+		core, err := json.Marshal(struct {
+			EventID   string          `json:"event_id"`
+			EventType string          `json:"event_type"`
+			Timestamp string          `json:"timestamp"`
+			Actor     mcr.Actor       `json:"actor"`
+			Payload   json.RawMessage `json:"payload"`
+		}{entry.EventID, entry.EventType, entry.Timestamp, entry.Actor, entry.Payload})
+		if err != nil {
+			t.Fatal(err)
+		}
+		digest := sha256.Sum256(append(append(core, '\n'), previousHash...))
+		entry.EventHash = "sha256:" + hex.EncodeToString(digest[:])
+		if err := json.NewEncoder(&ledger).Encode(entry); err != nil {
+			t.Fatal(err)
+		}
+		previousHash = entry.EventHash
+		return entry.EventHash
+	}
+	taskPayload := map[string]any{
+		"task_id": "task-1", "definition": map[string]any{
+			"namespace": "example", "id": "task", "version": "v1", "locator": "urn:example:task:v1",
+			"sha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+		},
+	}
+	appendEvent("header", "McrInitialized", map[string]any{"workspace_id": "workspace"})
+	opaqueHash := appendEvent("pre-task", "FutureObserved", map[string]any{"task_id": "task-1", "value": true})
+	appendEvent("task-created", "TaskCreated", taskPayload)
+	appendEvent("review", "ReviewSubmitted", map[string]any{
+		"task_id": "task-1", "subject": map[string]any{"fact_id": "pre-task", "record_hash": opaqueHash}, "outcome": "accepted",
+	})
+	workspacePath := writeLegacyWorkspace(t, ledger.Bytes(), []byte("{}\n"))
+	workspace, err := mcr.Open(workspacePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verification, err := workspace.Verify()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verification.StructuralValid || len(verification.Diagnostics) != 1 || verification.Diagnostics[0].Code != "invalid_payload" || verification.Diagnostics[0].RecordNumber != 4 {
+		t.Fatalf("Verify pre-Task reference = %#v, want record 4 invalid_payload", verification)
+	}
+	if _, err := workspace.Query(mcr.FactQuery{}); !errors.Is(err, mcr.ErrInvalidHistory) {
+		t.Fatalf("Query pre-Task reference = %v, want ErrInvalidHistory", err)
+	}
+
+	previousHash = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+	ledger.Reset()
+	appendEvent("header", "McrInitialized", map[string]any{"workspace_id": "workspace"})
+	appendEvent("task-created", "TaskCreated", taskPayload)
+	opaqueHash = appendEvent("task-opaque", "FutureObserved", map[string]any{"task_id": "task-1", "value": true})
+	appendEvent("review", "ReviewSubmitted", map[string]any{
+		"task_id": "task-1", "subject": map[string]any{"fact_id": "task-opaque", "record_hash": opaqueHash}, "outcome": "accepted",
+	})
+	workspace, err = mcr.Open(writeLegacyWorkspace(t, ledger.Bytes(), []byte("{}\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	verification, err = workspace.Verify()
+	if err != nil || !verification.StructuralValid || verification.Integrity != mcr.IntegritySealedValid {
+		t.Fatalf("Verify same-Task Opaque reference = %#v, %v", verification, err)
+	}
+}
+
 func TestLegacyCacheDiagnosticsAreNonAuthoritative(t *testing.T) {
 	ledger, err := os.ReadFile("testdata/legacy/unsealed-valid.jsonl")
 	if err != nil {

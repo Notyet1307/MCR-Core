@@ -346,6 +346,38 @@ func TestSubmitRejectsLedgerReplacementAroundRename(t *testing.T) {
 	}
 }
 
+func TestSubmitRejectsLedgerReplacementAfterValidation(t *testing.T) {
+	root := t.TempDir()
+	workspace, err := Create(root, "workspace")
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskPayload := json.RawMessage(`{"definition":{"namespace":"example.test","id":"neutral-task","version":"v1","locator":"urn:example:neutral-task:v1","sha256":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}}`)
+	if _, err := workspace.Submit(Submission{TaskID: "task-1", Actor: Actor{Type: "test", ID: "setup"}, Kind: KindTaskCreated, Payload: taskPayload}); err != nil {
+		t.Fatal(err)
+	}
+	ledgerPath := filepath.Join(root, ".mcr", "events.jsonl")
+	replacement := []byte("replacement ledger bytes")
+	afterSubmitHistoryRead = func() error {
+		if err := os.Rename(ledgerPath, filepath.Join(root, ".mcr", "validated-events.jsonl")); err != nil {
+			return err
+		}
+		return os.WriteFile(ledgerPath, replacement, 0o600)
+	}
+	defer func() { afterSubmitHistoryRead = func() error { return nil } }()
+	_, err = workspace.Submit(Submission{
+		TaskID: "task-1", Actor: Actor{Type: "test", ID: "submit"}, Kind: KindOpaqueRecorded,
+		Payload: json.RawMessage(`{"kind":"test.validation-race","data":{}}`),
+	})
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("Submit ledger replacement after validation = %v, want ErrConflict", err)
+	}
+	after, readErr := os.ReadFile(ledgerPath)
+	if readErr != nil || !bytes.Equal(after, replacement) {
+		t.Fatalf("replacement bytes changed: %q, %v", after, readErr)
+	}
+}
+
 func TestSubmitRejectsWorkspaceReplacementBeforeRename(t *testing.T) {
 	taskPayload := json.RawMessage(`{"definition":{"namespace":"example.test","id":"neutral-task","version":"v1","locator":"urn:example:neutral-task:v1","sha256":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}}`)
 	for _, replace := range []string{"root", "storage"} {

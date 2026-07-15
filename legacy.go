@@ -110,7 +110,7 @@ func parseLegacy(ledger io.ReadSeeker, sink factSink) (history, Verification, er
 			if sink != nil {
 				sink(fact, semanticPayload)
 			}
-			state.add(fact)
+			state.add(fact, semanticTaskID)
 		}
 		integrity.add(event, number)
 		lastID = event.EventID

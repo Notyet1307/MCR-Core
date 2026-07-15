@@ -40,6 +40,7 @@ var afterWorkspaceLock = func() error { return nil }
 var beforeWorkspaceIO = func() error { return nil }
 var beforeRootRegularOpen = func(string) error { return nil }
 var afterHistoryRead = func() error { return nil }
+var afterSubmitHistoryRead = func() error { return nil }
 
 type workspaceLock struct {
 	root      *os.Root
@@ -73,6 +74,7 @@ type history struct {
 	format         string
 	readOnly       bool
 	state          nativeState
+	ledgerIdentity os.FileInfo
 	lastRecordHash string
 }
 
@@ -151,10 +153,10 @@ func newNativeState(capacity int) nativeState {
 	return nativeState{tasks: make(map[string]bool), facts: make(map[string]factTarget, capacity)}
 }
 
-func (s *nativeState) add(fact Fact) {
-	s.facts[fact.FactID] = factTarget{TaskID: fact.TaskID, Kind: fact.Kind, RecordHash: fact.RecordHash}
+func (s *nativeState) add(fact Fact, semanticTaskID string) {
+	s.facts[fact.FactID] = factTarget{TaskID: semanticTaskID, Kind: fact.Kind, RecordHash: fact.RecordHash}
 	if fact.Kind == KindTaskCreated {
-		s.tasks[fact.TaskID] = true
+		s.tasks[semanticTaskID] = true
 	}
 }
 
@@ -374,6 +376,9 @@ func (w *Workspace) Submit(submission Submission) (Fact, error) {
 	if err != nil {
 		return zero, err
 	}
+	if err := afterSubmitHistoryRead(); err != nil {
+		return zero, err
+	}
 	if !acceptedHistory(verification) {
 		return zero, fmt.Errorf("%w: workspace ledger is not valid", ErrInvalidHistory)
 	}
@@ -411,7 +416,7 @@ func (w *Workspace) Submit(submission Submission) (Fact, error) {
 	if err != nil {
 		return zero, err
 	}
-	if err := w.appendRecord(lock, line); err != nil {
+	if err := w.appendRecord(lock, line, h.ledgerIdentity); err != nil {
 		return zero, err
 	}
 	return record.fact(), nil
@@ -602,6 +607,7 @@ func (w *Workspace) readHistory(storage *os.Root, sink factSink) (history, Verif
 	if err := verifyRootRegularIdentity(storage, "events.jsonl", ledgerIdentity); err != nil {
 		return history{}, Verification{}, err
 	}
+	h.ledgerIdentity = ledgerIdentity
 	return h, verification, nil
 }
 
@@ -1355,7 +1361,7 @@ func parseNative(ledger io.ReadSeeker, sink factSink) (history, Verification, er
 		if sink != nil {
 			sink(fact, fact.Payload)
 		}
-		state.add(fact)
+		state.add(fact, fact.TaskID)
 		previousHash = record.RecordHash
 		lastID = record.FactID
 	}
@@ -1727,7 +1733,7 @@ func validateContentRef(content ContentRef) error {
 	return nil
 }
 
-func (w *Workspace) appendRecord(lock *workspaceLock, line []byte) error {
+func (w *Workspace) appendRecord(lock *workspaceLock, line []byte, validatedLedger os.FileInfo) error {
 	if err := w.verifyOperationBoundary(); err != nil {
 		return err
 	}
@@ -1735,6 +1741,10 @@ func (w *Workspace) appendRecord(lock *workspaceLock, line []byte) error {
 	ledger, info, err := openRootRegular(lock.storage, ledgerName)
 	if err != nil {
 		return err
+	}
+	if !os.SameFile(info, validatedLedger) {
+		ledger.Close()
+		return fmt.Errorf("%w: events.jsonl changed after validation", ErrConflict)
 	}
 	if err := w.verifyCurrentStorage(); err != nil {
 		ledger.Close()
