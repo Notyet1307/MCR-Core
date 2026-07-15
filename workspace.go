@@ -27,6 +27,9 @@ const zeroHash = "sha256:0000000000000000000000000000000000000000000000000000000
 var nativeHash = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
 var beforeLedgerReplace = func() error { return nil }
+var afterLedgerReplace = func() error { return nil }
+var afterCreateRootLock = func() error { return nil }
+var beforeCreateLedger = func() error { return nil }
 var errNotRegular = errors.New("not regular")
 var errCacheNotObject = errors.New("cache not object")
 var errCacheInvalidJSON = errors.New("cache invalid JSON")
@@ -36,6 +39,7 @@ const maxLegacyCacheDepth = 10000
 var afterWorkspaceLock = func() error { return nil }
 var beforeWorkspaceIO = func() error { return nil }
 var beforeRootRegularOpen = func(string) error { return nil }
+var afterHistoryRead = func() error { return nil }
 
 type workspaceLock struct {
 	root      *os.Root
@@ -238,34 +242,58 @@ func Create(path, workspaceID string) (*Workspace, error) {
 	if path == "" || workspaceID == "" {
 		return nil, fmt.Errorf("%w: path and workspace ID are required", ErrConflict)
 	}
-	root, err := canonicalExistingDirectory(path)
+	rootPath, err := canonicalExistingDirectory(path)
 	if err != nil {
 		return nil, err
 	}
-	rootLock, err := lockDirectory(root, true)
+	root, err := os.OpenRoot(rootPath)
 	if err != nil {
-		return nil, err
+		return nil, rootEntryError(rootPath, err)
 	}
-	defer unlockDirectory(rootLock)
-
-	mcrDir := filepath.Join(root, ".mcr")
-	if err := os.Mkdir(mcrDir, 0o700); err != nil {
-		if errors.Is(err, os.ErrExist) {
-			return nil, fmt.Errorf("%w: %s already exists", ErrConflict, mcrDir)
+	defer root.Close()
+	rootIdentity, err := root.Stat(".")
+	if err != nil {
+		return nil, rootEntryError(rootPath, err)
+	}
+	rootDirectory, err := root.Open(".")
+	if err != nil {
+		return nil, rootEntryError(rootPath, err)
+	}
+	if err := syscall.Flock(int(rootDirectory.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		rootDirectory.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+			return nil, fmt.Errorf("%w: lock Workspace root: %w", ErrBusy, err)
 		}
-		return nil, fmt.Errorf("create workspace: %w", err)
+		return nil, fmt.Errorf("lock Workspace root: %w", err)
 	}
-	storage, err := openDirectory(mcrDir)
+	defer unlockDirectory(rootDirectory)
+	if err := afterCreateRootLock(); err != nil {
+		return nil, err
+	}
+	if err := verifyRootIdentity(rootPath, rootIdentity); err != nil {
+		return nil, err
+	}
+	if err := root.Mkdir(".mcr", 0o700); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return nil, fmt.Errorf("%w: .mcr already exists: %w", ErrConflict, err)
+		}
+		return nil, fmt.Errorf("create Workspace storage: %w", err)
+	}
+	storage, storageDirectory, storageIdentity, err := openRootStorage(root, ".mcr")
 	if err != nil {
-		return nil, fmt.Errorf("open workspace storage: %w", err)
+		return nil, fmt.Errorf("open Workspace storage: %w", err)
 	}
-	if err = storage.Chmod(0o700); err == nil {
-		err = storage.Close()
-	} else {
-		_ = storage.Close()
+	defer storage.Close()
+	defer storageDirectory.Close()
+	if err := storageDirectory.Chmod(0o700); err != nil {
+		return nil, fmt.Errorf("set Workspace storage permissions: %w", err)
 	}
-	if err != nil {
-		return nil, fmt.Errorf("set workspace storage permissions: %w", err)
+	workspace := &Workspace{path: rootPath, rootIdentity: rootIdentity, storageIdentity: storageIdentity}
+	if err := beforeCreateLedger(); err != nil {
+		return nil, err
+	}
+	if err := workspace.verifyCurrentStorage(); err != nil {
+		return nil, err
 	}
 
 	recordedAt := time.Now().UTC().Format(time.RFC3339Nano)
@@ -287,7 +315,7 @@ func Create(path, workspaceID string) (*Workspace, error) {
 	if err != nil {
 		return nil, err
 	}
-	ledger, err := os.OpenFile(filepath.Join(mcrDir, "events.jsonl"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	ledger, err := storage.OpenFile("events.jsonl", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("create ledger: %w", err)
 	}
@@ -302,15 +330,18 @@ func Create(path, workspaceID string) (*Workspace, error) {
 		err = closeErr
 	}
 	if err == nil {
-		err = syncDirectory(mcrDir)
+		err = storageDirectory.Sync()
 	}
 	if err == nil {
-		err = syncDirectory(root)
+		err = rootDirectory.Sync()
 	}
 	if err != nil {
 		return nil, fmt.Errorf("initialize ledger: %w", err)
 	}
-	return captureWorkspace(root)
+	if err := workspace.verifyCurrentStorage(); err != nil {
+		return nil, err
+	}
+	return workspace, nil
 }
 
 func Open(path string) (*Workspace, error) {
@@ -529,7 +560,7 @@ func (w *Workspace) readHistory(storage *os.Root, sink factSink) (history, Verif
 	if err := w.verifyOperationBoundary(); err != nil {
 		return history{}, Verification{}, err
 	}
-	ledger, _, err := openRootRegular(storage, "events.jsonl")
+	ledger, ledgerIdentity, err := openRootRegular(storage, "events.jsonl")
 	if err != nil {
 		return history{}, Verification{}, err
 	}
@@ -561,6 +592,15 @@ func (w *Workspace) readHistory(storage *os.Root, sink factSink) (history, Verif
 	}
 	if format == formatLegacy {
 		verification.Diagnostics = append(verification.Diagnostics, inspectLegacyCache(storage, h, verification)...)
+	}
+	if err := afterHistoryRead(); err != nil {
+		return history{}, Verification{}, err
+	}
+	if err := w.verifyCurrentStorage(); err != nil {
+		return history{}, Verification{}, err
+	}
+	if err := verifyRootRegularIdentity(storage, "events.jsonl", ledgerIdentity); err != nil {
+		return history{}, Verification{}, err
 	}
 	return h, verification, nil
 }
@@ -1700,27 +1740,28 @@ func (w *Workspace) appendRecord(lock *workspaceLock, line []byte) error {
 		ledger.Close()
 		return err
 	}
-	prior, err := io.ReadAll(ledger)
-	closeErr := ledger.Close()
-	if err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return fmt.Errorf("read workspace ledger for commit: %w", err)
-	}
 	temp, tempName, err := createRootTemp(lock.storage)
 	if err != nil {
+		ledger.Close()
 		return fmt.Errorf("create workspace ledger temporary file: %w", err)
 	}
 	defer lock.storage.Remove(tempName)
 	if err = temp.Chmod(info.Mode().Perm()); err == nil {
-		_, err = temp.Write(prior)
+		_, err = io.Copy(temp, ledger)
+	}
+	closeErr := ledger.Close()
+	if err == nil {
+		err = closeErr
 	}
 	if err == nil {
 		_, err = temp.Write(line)
 	}
 	if err == nil {
 		_, err = temp.Write([]byte{'\n'})
+	}
+	var replacementIdentity os.FileInfo
+	if err == nil {
+		replacementIdentity, err = temp.Stat()
 	}
 	if err == nil {
 		err = temp.Sync()
@@ -1738,13 +1779,25 @@ func (w *Workspace) appendRecord(lock *workspaceLock, line []byte) error {
 	if err := w.verifyCurrentStorage(); err != nil {
 		return err
 	}
+	if err := verifyRootRegularIdentity(lock.storage, ledgerName, info); err != nil {
+		return err
+	}
 	if err := lock.storage.Rename(tempName, ledgerName); err != nil {
+		return fmt.Errorf("replace workspace ledger: %w", err)
+	}
+	if err := verifyRootRegularIdentity(lock.storage, ledgerName, replacementIdentity); err != nil {
+		return err
+	}
+	if err := afterLedgerReplace(); err != nil {
 		return fmt.Errorf("replace workspace ledger: %w", err)
 	}
 	if err := lock.directory.Sync(); err != nil {
 		return fmt.Errorf("sync workspace storage: %w", err)
 	}
 	if err := w.verifyCurrentStorage(); err != nil {
+		return err
+	}
+	if err := verifyRootRegularIdentity(lock.storage, ledgerName, replacementIdentity); err != nil {
 		return err
 	}
 	return nil
@@ -1783,6 +1836,29 @@ func unlockWorkspace(lock *workspaceLock) {
 	_ = lock.directory.Close()
 	_ = lock.storage.Close()
 	_ = lock.root.Close()
+}
+
+func verifyRootIdentity(path string, expected os.FileInfo) error {
+	canonical, err := canonicalExistingDirectory(path)
+	if err != nil {
+		return err
+	}
+	if canonical != path {
+		return fmt.Errorf("%w: Workspace path no longer resolves to its canonical location", ErrConflict)
+	}
+	root, err := os.OpenRoot(path)
+	if err != nil {
+		return rootEntryError(path, err)
+	}
+	defer root.Close()
+	current, err := root.Stat(".")
+	if err != nil {
+		return rootEntryError(path, err)
+	}
+	if !os.SameFile(current, expected) {
+		return fmt.Errorf("%w: Workspace root identity changed", ErrConflict)
+	}
+	return nil
 }
 
 func captureWorkspace(path string) (*Workspace, error) {
@@ -1946,6 +2022,13 @@ func openRootRegular(root *os.Root, name string) (*os.File, os.FileInfo, error) 
 		return nil, nil, fmt.Errorf("%w: %s changed while opening", ErrConflict, name)
 	}
 	return file, after, nil
+}
+
+func verifyRootRegularIdentity(root *os.Root, name string, expected os.FileInfo) error {
+	if rootEntryChanged(root, name, expected, false) {
+		return fmt.Errorf("%w: %s identity changed", ErrConflict, name)
+	}
+	return nil
 }
 
 func rootEntryChanged(root *os.Root, name string, before os.FileInfo, directory bool) bool {

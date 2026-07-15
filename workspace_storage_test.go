@@ -412,9 +412,10 @@ func TestVerifyAndFilteredQueryDoNotRetainUnmatchedPayloads(t *testing.T) {
 	const maxResidentSetGrowth = 20 * 1024 * 1024
 	verifyGrowth := workspaceResidentSetGrowth(t, root, "verify", "")
 	queryGrowth := workspaceResidentSetGrowth(t, root, "query", matchedFactID)
-	t.Logf("native resident-set growth: Verify=%d Query=%d", verifyGrowth, queryGrowth)
-	if verifyGrowth > maxResidentSetGrowth || queryGrowth > maxResidentSetGrowth {
-		t.Fatalf("resident-set growth: Verify=%d Query=%d, want each <= %d", verifyGrowth, queryGrowth, maxResidentSetGrowth)
+	submitGrowth := workspaceResidentSetGrowth(t, root, "submit", "")
+	t.Logf("native resident-set growth: Verify=%d Query=%d Submit=%d", verifyGrowth, queryGrowth, submitGrowth)
+	if verifyGrowth > maxResidentSetGrowth || queryGrowth > maxResidentSetGrowth || submitGrowth > maxResidentSetGrowth {
+		t.Fatalf("resident-set growth: Verify=%d Query=%d Submit=%d, want each <= %d", verifyGrowth, queryGrowth, submitGrowth, maxResidentSetGrowth)
 	}
 
 	largeValue = strings.Repeat("x", 1024*1024)
@@ -530,6 +531,11 @@ func TestWorkspaceRetainedMemoryHelper(t *testing.T) {
 		if err == nil && len(facts) != 1 {
 			err = fmt.Errorf("filtered Query returned %d Facts", len(facts))
 		}
+	case "submit":
+		_, err = workspace.Submit(mcr.Submission{
+			TaskID: "task-neutral", Actor: mcr.Actor{Type: "test", ID: "memory"}, Kind: mcr.KindOpaqueRecorded,
+			Payload: json.RawMessage(`{"kind":"test.memory","data":{}}`),
+		})
 	case "invalid-query":
 		_, err = workspace.Query(mcr.FactQuery{})
 		if !errors.Is(err, mcr.ErrInvalidHistory) {

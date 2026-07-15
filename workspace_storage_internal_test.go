@@ -56,6 +56,94 @@ func TestSubmitFailureBeforeReplacePreservesLedger(t *testing.T) {
 	}
 }
 
+func TestCreateRejectsPathReplacementAndPreservesConflictCause(t *testing.T) {
+	t.Run("existing storage preserves cause", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.Mkdir(filepath.Join(root, ".mcr"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		_, err := Create(root, "workspace")
+		if !errors.Is(err, ErrConflict) || !errors.Is(err, os.ErrExist) {
+			t.Fatalf("Create existing storage = %v, want ErrConflict and os.ErrExist", err)
+		}
+	})
+
+	for _, phase := range []struct {
+		name    string
+		install func(func() error)
+		reset   func()
+	}{
+		{"after root lock", func(mutate func() error) { afterCreateRootLock = mutate }, func() { afterCreateRootLock = func() error { return nil } }},
+		{"before ledger", func(mutate func() error) { beforeCreateLedger = mutate }, func() { beforeCreateLedger = func() error { return nil } }},
+	} {
+		t.Run(phase.name, func(t *testing.T) {
+			parent := t.TempDir()
+			root := filepath.Join(parent, "workspace")
+			target := filepath.Join(parent, "target")
+			if err := os.Mkdir(root, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(target, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			targetMarker := filepath.Join(target, "marker")
+			if err := os.WriteFile(targetMarker, []byte("unchanged"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			phase.install(func() error {
+				if err := os.Rename(root, filepath.Join(parent, "moved")); err != nil {
+					return err
+				}
+				return os.Symlink(target, root)
+			})
+			defer phase.reset()
+
+			if _, err := Create(root, "workspace"); !errors.Is(err, ErrConflict) {
+				t.Fatalf("Create %s replacement = %v, want ErrConflict", phase.name, err)
+			}
+			marker, err := os.ReadFile(targetMarker)
+			if err != nil || string(marker) != "unchanged" {
+				t.Fatalf("target changed: %q, %v", marker, err)
+			}
+			if _, err := os.Stat(filepath.Join(target, ".mcr")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("target storage created: %v", err)
+			}
+		})
+	}
+	t.Run("storage before ledger", func(t *testing.T) {
+		parent := t.TempDir()
+		root := filepath.Join(parent, "workspace")
+		target := filepath.Join(parent, "target")
+		if err := os.Mkdir(root, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(target, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		marker := filepath.Join(target, "marker")
+		if err := os.WriteFile(marker, []byte("unchanged"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		beforeCreateLedger = func() error {
+			if err := os.Rename(filepath.Join(root, ".mcr"), filepath.Join(parent, "moved-storage")); err != nil {
+				return err
+			}
+			return os.Symlink(target, filepath.Join(root, ".mcr"))
+		}
+		defer func() { beforeCreateLedger = func() error { return nil } }()
+		if _, err := Create(root, "workspace"); !errors.Is(err, ErrConflict) {
+			t.Fatalf("Create storage replacement = %v, want ErrConflict", err)
+		}
+		content, err := os.ReadFile(marker)
+		if err != nil || string(content) != "unchanged" {
+			t.Fatalf("target changed: %q, %v", content, err)
+		}
+		if _, err := os.Stat(filepath.Join(target, "events.jsonl")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("target ledger created: %v", err)
+		}
+	})
+}
+
 func TestWorkspaceOperationsRejectRootReplacementAfterLock(t *testing.T) {
 	taskPayload := json.RawMessage(`{"definition":{"namespace":"example.test","id":"neutral-task","version":"v1","locator":"urn:example:neutral-task:v1","sha256":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}}`)
 	operations := []struct {
@@ -85,6 +173,7 @@ func TestWorkspaceOperationsRejectRootReplacementAfterLock(t *testing.T) {
 				return nil
 			}
 		}, func() { beforeRootRegularOpen = func(string) error { return nil } }},
+		{"after history read", func(mutate func() error) { afterHistoryRead = mutate }, func() { afterHistoryRead = func() error { return nil } }},
 	}
 	for _, phase := range phases {
 		t.Run(phase.name, func(t *testing.T) {
@@ -169,6 +258,91 @@ func TestWorkspaceOperationsRejectLedgerSymlinkRace(t *testing.T) {
 	}
 	if !bytes.Equal(after, before) {
 		t.Fatal("ledger changed during symlink race")
+	}
+}
+
+func TestWorkspaceOperationsRejectLedgerReplacementAfterRead(t *testing.T) {
+	operations := []struct {
+		name string
+		run  func(*Workspace) error
+	}{
+		{"Submit", func(workspace *Workspace) error {
+			_, err := workspace.Submit(Submission{
+				TaskID: "task-1", Actor: Actor{Type: "integration", ID: "test-host"}, Kind: KindTaskCreated,
+				Payload: json.RawMessage(`{"definition":{"namespace":"example.test","id":"neutral-task","version":"v1","locator":"urn:example:neutral-task:v1","sha256":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}}`),
+			})
+			return err
+		}},
+		{"Query", func(workspace *Workspace) error { _, err := workspace.Query(FactQuery{}); return err }},
+		{"Replay", func(workspace *Workspace) error { _, err := workspace.Replay(); return err }},
+		{"Verify", func(workspace *Workspace) error { _, err := workspace.Verify(); return err }},
+	}
+	for _, operation := range operations {
+		t.Run(operation.name, func(t *testing.T) {
+			root := t.TempDir()
+			workspace, err := Create(root, "workspace")
+			if err != nil {
+				t.Fatal(err)
+			}
+			ledgerPath := filepath.Join(root, ".mcr", "events.jsonl")
+			replacement := []byte("replacement ledger bytes")
+			afterHistoryRead = func() error {
+				if err := os.Rename(ledgerPath, filepath.Join(root, ".mcr", "displaced-events.jsonl")); err != nil {
+					return err
+				}
+				return os.WriteFile(ledgerPath, replacement, 0o600)
+			}
+			defer func() { afterHistoryRead = func() error { return nil } }()
+			if err := operation.run(workspace); !errors.Is(err, ErrConflict) {
+				t.Fatalf("%s ledger replacement = %v, want ErrConflict", operation.name, err)
+			}
+			after, err := os.ReadFile(ledgerPath)
+			if err != nil || !bytes.Equal(after, replacement) {
+				t.Fatalf("replacement bytes changed: %q, %v", after, err)
+			}
+		})
+	}
+}
+
+func TestSubmitRejectsLedgerReplacementAroundRename(t *testing.T) {
+	for _, phase := range []string{"before", "after"} {
+		t.Run(phase, func(t *testing.T) {
+			root := t.TempDir()
+			workspace, err := Create(root, "workspace")
+			if err != nil {
+				t.Fatal(err)
+			}
+			taskPayload := json.RawMessage(`{"definition":{"namespace":"example.test","id":"neutral-task","version":"v1","locator":"urn:example:neutral-task:v1","sha256":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}}`)
+			if _, err := workspace.Submit(Submission{TaskID: "task-1", Actor: Actor{Type: "test", ID: "setup"}, Kind: KindTaskCreated, Payload: taskPayload}); err != nil {
+				t.Fatal(err)
+			}
+			ledgerPath := filepath.Join(root, ".mcr", "events.jsonl")
+			replacement := []byte("replacement ledger bytes")
+			mutate := func() error {
+				if err := os.Rename(ledgerPath, filepath.Join(root, ".mcr", "displaced-events.jsonl")); err != nil {
+					return err
+				}
+				return os.WriteFile(ledgerPath, replacement, 0o600)
+			}
+			if phase == "before" {
+				beforeLedgerReplace = mutate
+				defer func() { beforeLedgerReplace = func() error { return nil } }()
+			} else {
+				afterLedgerReplace = mutate
+				defer func() { afterLedgerReplace = func() error { return nil } }()
+			}
+			_, err = workspace.Submit(Submission{
+				TaskID: "task-1", Actor: Actor{Type: "test", ID: "submit"}, Kind: KindOpaqueRecorded,
+				Payload: json.RawMessage(`{"kind":"test.storage-race","data":{}}`),
+			})
+			if !errors.Is(err, ErrConflict) {
+				t.Fatalf("Submit %s ledger replacement = %v, want ErrConflict", phase, err)
+			}
+			after, readErr := os.ReadFile(ledgerPath)
+			if readErr != nil || !bytes.Equal(after, replacement) {
+				t.Fatalf("replacement bytes changed: %q, %v", after, readErr)
+			}
+		})
 	}
 }
 
